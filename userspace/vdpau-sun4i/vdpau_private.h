@@ -120,7 +120,7 @@ struct decoder_ctx {
 	 * filter thread, mpv mixes in the VO thread) */
 	pthread_mutex_t lock;
 
-	/* EXPERIMENT (D1): keep one picture's request in flight while queueing
+	/* EXPERIMENT: keep one picture's request in flight while queueing
 	 * the next (as GStreamer does), VDPAU_SUN4I_PIPELINE=1. Known limits:
 	 * a failed wait leaves the request queued, an error of the in-flight
 	 * picture is not reported to the picture that references it, and a

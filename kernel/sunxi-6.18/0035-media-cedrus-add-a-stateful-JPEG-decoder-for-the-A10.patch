@@ -1036,7 +1036,7 @@ index 000000000..8490c2239
 +		pix_format->sizeimage = stride * rows +
 +					stride * ALIGN(rows, 64) / 2;
 +	else
-+		/* Full-height chroma; the VE never writes past it (J2). */
++		/* Full-height chroma; the VE never writes past it. */
 +		pix_format->sizeimage = 2 * stride * rows;
 +
 +	/*

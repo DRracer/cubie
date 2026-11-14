@@ -485,7 +485,7 @@ VdpStatus vdp_presentation_queue_set_background_color(VdpPresentationQueue queue
 		return VDP_STATUS_INVALID_POINTER;
 	if (!q)
 		return VDP_STATUS_INVALID_HANDLE;
-	q->background = *background_color;	/* would be the colour key (D5) */
+	q->background = *background_color;	/* would be the colour key */
 	return VDP_STATUS_OK;
 }
 
