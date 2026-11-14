@@ -25,7 +25,7 @@ general, the overlays and Bluetooth notes are board specific.
 | Async page flips | no | fullscreen GL without vsync flips instead of copying (1080p: 29 -> 108 FPS; the DRAM clock also differed between the runs, see the Cubietruck guide) | 0015 |
 | 2D engine (G2D, "mixer processor") | no driver | driver `sun4i-mp`; the patched X server copies with it (scrolling ~4x faster) | 0018-0022, 0038 + [`userspace/xserver-g2d/`](userspace/xserver-g2d/) |
 | Video overlay scaling | aliasing; >2x vertical downscale corrupts the screen | filtered; skips lines or refuses cleanly beyond the frontend's throughput | 0004, 0016, 0017 |
-| H.264 / MPEG-2 hardware decode (cedrus) | half clock after boot; B-frames wrong on ARM32 (cache alias); no X player path | bit-exact on real content, VE at 192 MHz; zero-copy playback in mpv/MPlayer via VDPAU on an overlay plane | 0023-0030, 0001, 0002 + [`userspace/vdpau-sun4i/`](userspace/vdpau-sun4i/) (**security:** 0001/0002 let any X client draw over the whole screen, lock screen included; see the [patch index](kernel/sunxi-6.18/README.md)) |
+| H.264 / MPEG-2 hardware decode (cedrus) | half clock after boot; B-frames wrong on ARM32 (cache alias); no X player path | bit-exact on real content, VE at 192 MHz; zero-copy playback in mpv/MPlayer via VDPAU (or GStreamer via `sun4iximagesink`) on an overlay plane | 0023-0030, 0001, 0002 + [`userspace/vdpau-sun4i/`](userspace/vdpau-sun4i/) (**security:** 0001/0002 let any X client draw over the whole screen, lock screen included; see the [patch index](kernel/sunxi-6.18/README.md)) |
 | H.264 hardware encode | no encoder | V4L2 M2M encoder up to 1920x1088, CBR rate control (FFmpeg `h264_v4l2m2m`), per-MB motion vectors, encode and decode at once; A10 output bit-identical to the A20 | 0023, 0024, 0031, 0032 |
 | (M)JPEG hardware decode / encode | no | stateful decoder `cedrus-jpeg` (e.g. UVC webcam MJPEG, up to 4096x4096) and encoder `cedrus-jpeg-enc` | 0033-0036 + [`userspace/gstreamer/`](userspace/gstreamer/) |
 | Cubietruck Bluetooth (AP6210) | setup fails on about half the boots; cannot scan or pair | works (crystal-gated power-up) | 0006-0008 + [`boards/cubietruck/bluetooth/`](boards/cubietruck/bluetooth/) |
@@ -49,6 +49,7 @@ on Xorg for now ([`userspace/wayland/`](userspace/wayland/)).
 | [`boards/mk802/`](boards/mk802/) | MK802 (A10) notes |
 | [`userspace/vdpau-sun4i/`](userspace/vdpau-sun4i/) | VDPAU driver `libvdpau_sun4i-drm` for zero-copy H.264 playback, with test scripts |
 | [`userspace/xserver-g2d/`](userspace/xserver-g2d/) | patch for Debian Trixie's X server: glamor copies on the 2D engine |
+| [`userspace/sun4iximagesink/`](userspace/sun4iximagesink/) | GStreamer video sink: zero-copy playback on an overlay plane under X |
 | [`userspace/gstreamer/`](userspace/gstreamer/) | two small GStreamer format-mapping patches |
 | [`userspace/wayland/`](userspace/wayland/) | experimental Weston and waylandsink patches |
 | [`tools/check-public.sh`](tools/check-public.sh) | consistency check of the patch headers |

@@ -18,6 +18,8 @@ the copyright line is in each file or below) and CC-BY-4.0.
   (the notice is in the new file `glamor/glamor_g2d.c`).
 - **GStreamer patches** (`userspace/gstreamer/`, `userspace/wayland/gst-wayland/`):
   LGPL-2.1-or-later, the licence of the GStreamer files they change.
+- **GStreamer video sink** (`userspace/sun4iximagesink/`): LGPL-2.1-or-later, like GStreamer
+  plugins in general (Copyright (C) 2026 D.R.racer; text in its `COPYING`).
 - **Weston patches** (`userspace/wayland/weston/`): MIT, the licence of Weston.
 - **Bluetooth scripts** (`boards/cubietruck/bluetooth/`): MIT (Expat) licence, the same text as
   the VDPAU driver below (Copyright (c) 2026 D.R.racer).
