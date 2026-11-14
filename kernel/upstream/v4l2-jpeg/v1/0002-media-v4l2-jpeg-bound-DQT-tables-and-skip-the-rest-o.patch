@@ -1,0 +1,55 @@
+From 172626d662942357ead30d3c2907899f080ffb01 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Wed, 28 Oct 2026 18:38:08 +0100
+Subject: [PATCH 2/3] media: v4l2-jpeg: bound DQT tables and skip the rest of
+ the segment
+To: Mauro Carvalho Chehab <mchehab@kernel.org>
+Cc: Hans Verkuil <hverkuil@kernel.org>,
+    Philipp Zabel <p.zabel@pengutronix.de>,
+    Mirela Rabulea <mirela.rabulea@nxp.com>,
+    imx@lists.linux.dev,
+    linux-media@vger.kernel.org,
+    linux-kernel@vger.kernel.org
+
+jpeg_parse_quantization_tables() only checks that 65 bytes are left
+before it reads a table, which is enough for an 8-bit table but not for
+a 16-bit one (129 bytes), so a 16-bit table can be read from the
+following segments and accepted. It also returns without skipping what
+is left of the segment, unlike the other segment parsers, so trailing
+bytes inside the segment are scanned for markers.
+
+Reject tables that overrun the segment and skip its remainder.
+
+Fixes: 50733b5b9102 ("media: add v4l2 JPEG helpers")
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/media/v4l2-core/v4l2-jpeg.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-jpeg.c b/drivers/media/v4l2-core/v4l2-jpeg.c
+index 958d64d89..c2b4761b3 100644
+--- a/drivers/media/v4l2-core/v4l2-jpeg.c
++++ b/drivers/media/v4l2-core/v4l2-jpeg.c
+@@ -447,6 +447,9 @@ static int jpeg_parse_quantization_tables(struct jpeg_stream *stream,
+ 		 */
+ 		if (pq != 0 && (pq != 1 || precision != 12))
+ 			return -EINVAL;
++		/* the table must fit in the segment */
++		if (len < (pq ? 129 : 65))
++			return -EINVAL;
+ 
+ 		/* quantization table destination identifier */
+ 		tq = pq_tq & 0xf;
+@@ -467,7 +470,8 @@ static int jpeg_parse_quantization_tables(struct jpeg_stream *stream,
+ 		len -= pq ? 129 : 65;
+ 	}
+ 
+-	return 0;
++	/* Skip what is left of the segment, as for the other segments. */
++	return jpeg_skip(stream, len);
+ }
+ 
+ /* B.2.4.2 Huffman table-specification syntax */
+-- 
+2.55.0
+

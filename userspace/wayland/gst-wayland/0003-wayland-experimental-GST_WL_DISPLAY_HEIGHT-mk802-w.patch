@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Sat, 31 Oct 2026 00:34:13 +0100
+Subject: [PATCH] wayland: experimental GST_WL_DISPLAY_HEIGHT (MK802,
+ wlroots direct scan-out test)
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ wayland/gstwllinuxdmabuf.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/gst-libs/gst/wayland/gstwllinuxdmabuf.c b/gst-libs/gst/wayland/gstwllinuxdmabuf.c
+index b3f540e..f48bffd 100644
+--- a/gst-libs/gst/wayland/gstwllinuxdmabuf.c
++++ b/gst-libs/gst/wayland/gstwllinuxdmabuf.c
+@@ -152,6 +152,15 @@ gst_wl_linux_dmabuf_construct_wl_buffer (GstBuffer * buf,
+     goto out;
+   }
+ 
++  /* Experimental (MK802): GST_WL_DISPLAY_HEIGHT=1 creates the wl_buffer with
++   * the display height (e.g. 1080) instead of the meta's (1088 for 32-line
++   * tiles), so the compositor needs no crop (wlroots 0.18 direct scan-out
++   * refuses a src_box). */
++  if (vmeta && g_getenv ("GST_WL_DISPLAY_HEIGHT") &&
++      GST_VIDEO_INFO_HEIGHT (&drm_info->vinfo) > 0 &&
++      GST_VIDEO_INFO_HEIGHT (&drm_info->vinfo) < height)
++    height = GST_VIDEO_INFO_HEIGHT (&drm_info->vinfo);
++
+   GST_DEBUG_OBJECT (display,
+       "Creating wl_buffer from DMABuf of size %" G_GSSIZE_FORMAT
+       " (%d x %d), DRM fourcc %" GST_FOURCC_FORMAT, gst_buffer_get_size (buf),
+-- 
+2.55.0
+

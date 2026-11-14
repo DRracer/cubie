@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Fri, 30 Oct 2026 19:28:00 +0100
+Subject: [PATCH] iio: adc: sun4i-gpadc: wait for a mode change only when
+ the mode changes
+
+sun4i_prepare_for_irq() waits 100 ms when the IP switches between the
+ADC and the touchscreen mode, but it compares the previous mode with
+the ADC mode, whatever mode is being set. A temperature read sets the
+touchscreen mode, so the next temperature read finds "not ADC mode"
+again and waits too: every temperature read takes 100 ms. With the
+thermal zone polled every second (A10), this busy wait keeps the CPU
+10% busy and the cpufreq governor at the highest operating point.
+
+Compare the previous mode with the one being set.
+
+Fixes: d1caa9905538 ("iio: adc: add support for Allwinner SoCs ADC")
+Tested on a Rikomagic MK802 (A10, 1 GiB).
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/iio/adc/sun4i-gpadc-iio.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/iio/adc/sun4i-gpadc-iio.c b/drivers/iio/adc/sun4i-gpadc-iio.c
+index c1ea91ece..d51f50423 100644
+--- a/drivers/iio/adc/sun4i-gpadc-iio.c
++++ b/drivers/iio/adc/sun4i-gpadc-iio.c
+@@ -161,7 +161,7 @@ static int sun4i_prepare_for_irq(struct iio_dev *indio_dev, int channel,
+ {
+ 	struct sun4i_gpadc_iio *info = iio_priv(indio_dev);
+ 	int ret;
+-	u32 reg;
++	u32 reg, adc_select;
+ 
+ 	pm_runtime_get_sync(indio_dev->dev.parent);
+ 
+@@ -178,6 +178,7 @@ static int sun4i_prepare_for_irq(struct iio_dev *indio_dev, int channel,
+ 		return ret;
+ 
+ 	if (irq == info->fifo_data_irq) {
++		adc_select = info->data->tp_adc_select;
+ 		ret = regmap_write(info->regmap, SUN4I_GPADC_CTRL1,
+ 				   info->data->tp_mode_en |
+ 				   info->data->tp_adc_select |
+@@ -195,6 +196,7 @@ static int sun4i_prepare_for_irq(struct iio_dev *indio_dev, int channel,
+ 		 * The temperature sensor returns valid data only when the ADC
+ 		 * operates in touchscreen mode.
+ 		 */
++		adc_select = 0;
+ 		ret = regmap_write(info->regmap, SUN4I_GPADC_CTRL1,
+ 				   info->data->tp_mode_en);
+ 	}
+@@ -206,7 +208,7 @@ static int sun4i_prepare_for_irq(struct iio_dev *indio_dev, int channel,
+ 	 * When the IP changes mode between ADC or touchscreen, it
+ 	 * needs a bit of time to get correct values.
+ 	 */
+-	if ((reg & info->data->tp_adc_select) != info->data->tp_adc_select)
++	if ((reg & info->data->tp_adc_select) != adc_select)
+ 		mdelay(100);
+ 
+ 	return 0;
+-- 
+2.55.0
+

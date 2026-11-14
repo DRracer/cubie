@@ -1,0 +1,85 @@
+From 63d927a5226baf0d40d62cb4aa9fb94ab1337b0b Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Wed, 28 Oct 2026 18:44:40 +0100
+Subject: [PATCH 0/3] media: v4l2-jpeg: fix segment length handling in the header parser
+To: Mauro Carvalho Chehab <mchehab@kernel.org>
+Cc: Hans Verkuil <hverkuil@kernel.org>,
+    Philipp Zabel <p.zabel@pengutronix.de>,
+    Mirela Rabulea <mirela.rabulea@nxp.com>,
+    imx@lists.linux.dev,
+    linux-media@vger.kernel.org,
+    linux-kernel@vger.kernel.org
+
+v4l2_jpeg_parse_header() can move backwards in the buffer: the DHT
+parser ends every segment with a skip of -2 bytes, which jpeg_skip()
+turns into a wrapped size_t and accepts, and tables that overrun their
+DHT, DQT or APP14 segment leave negative lengths that end the same way.
+Malformed tables can be accepted, and some well-formed but unusual
+segments (a DHT ending in ff db, trailing bytes in a DQT) fail.
+
+Patch 1 fixes the end of DHT parsing and rejects DHT tables that overrun
+their segment, patch 2 does the same for DQT and skips the rest of the
+segment, and patch 3 bounds jpeg_skip() by the bytes left, so negative
+lengths fail, which also fixes short APP14 segments. Patch 3 needs
+patch 1 (said in its message): without it every DHT segment would fail.
+
+How it was found and tested:
+
+- Found while writing a JPEG decoder for the Allwinner A10/A20 video
+  engine (not upstream) that uses v4l2_jpeg_parse_header(): the parser
+  built for the host under ASan/UBSan reports the pointer overflow in
+  jpeg_skip() on the first frame of every JPEG with a DHT segment. The
+  kernel build (-fno-strict-overflow) treats it as wrapping; the bug is
+  that parsing resumes two bytes back.
+- Host harness (the file built with clang ASan/UBSan, each input in a
+  buffer of its exact size), v7.3 vs v7.3 + each patch of the series:
+  - 1180 frames from 543 files (libjpeg-turbo, ffmpeg, PIL,
+    ImageMagick, a Logitech C170 camera incl. its broken frames,
+    fault-injected and hand-made files; 4:2:0, 4:2:2, 4:4:4, gray,
+    CMYK, with and without DHT, DRI and Adobe APP14), each parsed with
+    and without table arrays: identical results after every patch
+    (every offset, length and field), the same 9 frames rejected
+    (progressive, sampling factors the helper does not support);
+  - crafted inputs, each fixed by its own patch: BITS overrunning the
+    DHT segment were accepted for 2 of 5 base files (rejected by chance
+    for the others) and a DHT ending in ff db failed with -EINVAL
+    (patch 1); a 16-bit table overrunning the DQT segment was accepted
+    and a DQT with trailing ff c2 bytes failed (patch 2); an 8-byte
+    Adobe APP14 segment was accepted (patch 3);
+  - with the whole series, every truncation of the header region plus
+    3000 random byte and bit mutations per frame, for 488 frames (5.85
+    million parses): no sanitizer report and no hang.
+- W=1 build for ARM (sunxi_defconfig + COMPILE_TEST with coda and
+  imx-jpeg, the two in-tree users) after each patch, no new warnings.
+  sparse and smatch were not run.
+- v4l2-jpeg.c is the same in 6.18 and v7.3. The series without the
+  16-bit DQT check runs in the A20 decoder on a Cubietruck since
+  2026-10-25 (8-bit tables only, so the 16-bit check is host-tested
+  only). Not tested on coda or imx-jpeg hardware.
+- Applies unchanged to media-committers next (d7e7bca71698): its
+  v4l2-jpeg.c is identical to v7.3.
+- Callers: coda passes table arrays and sees the stricter DHT/DQT
+  segment handling (a segment that declares more bytes than its tables
+  is now skipped in full); imx-jpeg passes none and is only affected
+  by the jpeg_skip() bound (short APP14 segments now fail).
+
+No Cc: stable: the backwards skips never leave the buffer, so these are
+parse errors and acceptance of malformed tables, not memory safety
+issues; I leave stable to your judgement.
+
+The patches and this letter were written with an AI assistant; I
+reviewed and tested them.
+
+D.R.racer (3):
+  media: v4l2-jpeg: fix the end of DHT segment parsing
+  media: v4l2-jpeg: bound DQT tables and skip the rest of the segment
+  media: v4l2-jpeg: bound jpeg_skip() by the bytes left
+
+ drivers/media/v4l2-core/v4l2-jpeg.c | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+
+base-commit: c03c1a14507dfaf8b856c2608f9ac216021fc222
+-- 
+2.55.0
+

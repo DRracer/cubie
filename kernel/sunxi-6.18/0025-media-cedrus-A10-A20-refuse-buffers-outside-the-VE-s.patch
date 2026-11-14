@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Thu, 15 Oct 2026 18:12:13 +0200
+Subject: [PATCH] media: cedrus: A10/A20: refuse buffers outside the VE's
+ 256 MB window
+
+The A20 VE only reaches the first 256 MB of DRAM; the A10 VE is the
+same generation (same version register value 0x1623) and gets the same
+check. When the default CMA
+pool cannot be placed in that window (a 160 MB pool did not fit next to
+the initrd that U-Boot loads below 0x4a000000), the kernel silently
+falls back to a pool elsewhere (here 0x76000000) and every codec buffer
+would alias into the wrong 256 MB of RAM. A 28-bit DMA mask is rejected
+on arm32 (it must cover lowmem), so check explicitly on the physical
+address: probe allocates a test buffer and refuses to bind if the pool
+is outside the window, and buf_prepare rejects any buffer (including
+DMABUF imports) beyond it.
+
+The probe also refuses to bind if the test buffer's bus address lacks
+the MBUS DMA offset (bus = phys - PHYS_OFFSET) that sunxi_mbus sets:
+the VE would then write 1 GiB away from its buffers on 2 GiB boards.
+The driver core drops that offset on unbind and deferred probe;
+sunxi_mbus restores it before every bind ("soc: sunxi: mbus: restore
+the DMA offset when a driver binds again"), this check makes a
+regression fail safely.
+
+Tested on Cubieboard2 and Cubietruck (A20).
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/staging/media/sunxi/cedrus/cedrus.c   | 40 +++++++++++++++++++
+ drivers/staging/media/sunxi/cedrus/cedrus.h   | 18 +++++++++
+ .../media/sunxi/cedrus/cedrus_context.c       |  9 +++++
+ 3 files changed, 67 insertions(+)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+index 0b779e005..57a8826d8 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -394,6 +394,44 @@ static int cedrus_resources_setup(struct cedrus_device *cedrus_dev,
+ 		return ret;
+ 	}
+ 
++	/*
++	 * The A20 VE only reaches the first 256 MB of DRAM (bus addresses,
++	 * offset by sunxi_mbus). If the CMA pool cannot be placed there, the
++	 * kernel silently puts it elsewhere and every codec buffer would point
++	 * the VE at the wrong memory: refuse to bind. (A 28-bit DMA mask is
++	 * not accepted on arm32: it would not cover all of lowmem.)
++	 */
++	cedrus_dev->dma_window = variant->dma_window;
++	if (cedrus_dev->dma_window) {
++		dma_addr_t dma;
++		void *probe_buf = dma_alloc_attrs(dev, SZ_64K, &dma, GFP_KERNEL,
++						  DMA_ATTR_NO_KERNEL_MAPPING);
++
++		if (!probe_buf) {
++			ret = -ENOMEM;
++			goto error_memory;
++		}
++		dma_free_attrs(dev, SZ_64K, probe_buf, dma,
++			       DMA_ATTR_NO_KERNEL_MAPPING);
++		/*
++		 * sunxi_mbus gives the VE its DMA offset (bus = phys -
++		 * PHYS_OFFSET). Without it the VE is handed CPU physical
++		 * addresses, which land 1 GiB off target on 2 GiB boards.
++		 */
++		if (dma_to_phys(dev, dma) - dma != PHYS_OFFSET) {
++			dev_err(dev, "VE DMA address %pad lacks the MBUS offset\n",
++				&dma);
++			ret = -EINVAL;
++			goto error_memory;
++		}
++		if (!cedrus_dma_in_window(cedrus_dev, dma, SZ_64K)) {
++			dev_err(dev, "CMA pool at %pad is outside the VE's first %llu MB of DRAM (check reserved-memory/default-pool and U-Boot bootm_size)\n",
++				&dma, cedrus_dev->dma_window >> 20);
++			ret = -ENOMEM;
++			goto error_memory;
++		}
++	}
++
+ 	/* SRAM */
+ 
+ 	ret = sunxi_sram_claim(dev);
+@@ -488,6 +526,7 @@ static const struct cedrus_variant cedrus_variant_sun4i_a10 = {
+ 			  CEDRUS_CAPABILITY_H264_ENC,
+ 	.clock_mod_rate	= 320000000,
+ 	.enc_gen	= CEDRUS_ENC_GEN_A20,
++	.dma_window	= SZ_256M,
+ };
+ 
+ static const struct cedrus_variant cedrus_variant_sun5i_a13 = {
+@@ -504,6 +543,7 @@ static const struct cedrus_variant cedrus_variant_sun7i_a20 = {
+ 			  CEDRUS_CAPABILITY_H264_ENC,
+ 	.clock_mod_rate	= 320000000,
+ 	.enc_gen	= CEDRUS_ENC_GEN_A20,
++	.dma_window	= SZ_256M,
+ };
+ 
+ static const struct cedrus_variant cedrus_variant_sun8i_a33 = {
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+index 99df6072a..40f33639f 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -11,6 +11,7 @@
+ #ifndef _CEDRUS_H_
+ #define _CEDRUS_H_
+ 
++#include <linux/dma-direct.h>
+ #include <linux/iopoll.h>
+ #include <linux/videodev2.h>
+ #include <linux/workqueue.h>
+@@ -72,6 +73,8 @@ struct cedrus_variant {
+ 	unsigned int		capabilities;
+ 	unsigned int		clock_mod_rate;
+ 	enum cedrus_enc_gen	enc_gen;
++	/* DRAM size from its start the VE can reach (0 = no limit). */
++	u64			dma_window;
+ };
+ 
+ struct cedrus_format {
+@@ -103,6 +106,7 @@ struct cedrus_device {
+ 	enum cedrus_enc_gen	enc_gen;
+ 
+ 	struct delayed_work	watchdog_work;
++	u64			dma_window;
+ 
+ 	/* Role of the last job (encoder/decoder), -1 after probe or reset. */
+ 	int			last_job_role;
+@@ -226,4 +230,18 @@ cedrus_buffer_from_vb2(const struct vb2_buffer *vb2_buffer)
+ 	return container_of(v4l2_buffer, struct cedrus_buffer, m2m_buffer.vb);
+ }
+ 
++/*
++ * True if [dma, dma + size) lies in the DRAM window the VE can reach, i.e. the
++ * first dma_window bytes of DRAM. Checked on the physical address.
++ */
++static inline bool cedrus_dma_in_window(struct cedrus_device *dev,
++					dma_addr_t dma, size_t size)
++{
++	phys_addr_t phys = dma_to_phys(dev->dev, dma);
++
++	return !dev->dma_window ||
++	       (phys >= PHYS_OFFSET &&
++		phys - PHYS_OFFSET + size <= dev->dma_window);
++}
++
+ #endif
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_context.c b/drivers/staging/media/sunxi/cedrus/cedrus_context.c
+index f4c7eb29c..addff9e6f 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_context.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_context.c
+@@ -542,6 +542,15 @@ static int cedrus_context_buffer_prepare(struct vb2_buffer *vb2_buffer)
+ 	if (vb2_plane_size(vb2_buffer, 0) < pix_format->sizeimage)
+ 		return -EINVAL;
+ 
++	/* Also catches DMABUF imports the VE could not reach. */
++	if (!cedrus_dma_in_window(ctx->proc->dev,
++				  vb2_dma_contig_plane_dma_addr(vb2_buffer, 0),
++				  vb2_plane_size(vb2_buffer, 0))) {
++		dev_err_ratelimited(ctx->proc->dev->dev,
++				    "buffer outside the VE's DMA window\n");
++		return -EINVAL;
++	}
++
+ 	/* The picture buffer bytesused is always from the driver side. */
+ 	if (format_type == CEDRUS_FORMAT_TYPE_PICTURE)
+ 		vb2_set_plane_payload(vb2_buffer, 0, pix_format->sizeimage);
+-- 
+2.55.0
+

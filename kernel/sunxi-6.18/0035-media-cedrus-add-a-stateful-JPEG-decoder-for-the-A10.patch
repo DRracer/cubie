@@ -1,0 +1,2165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Sun, 25 Oct 2026 07:35:36 +0100
+Subject: [PATCH] media: cedrus: add a stateful JPEG decoder for the
+ A10/A20 VE
+
+The A10/A20 video engine decodes baseline JPEG on its MPEG engine. Add
+it as a third video node, cedrus-jpeg, with the stateful decoder API of
+dev-decoder.rst: there is no stateless JPEG uAPI and every other JPEG
+decoder in the tree is stateful.
+
+- OUTPUT takes V4L2_PIX_FMT_JPEG or MJPEG, one frame per buffer, MMAP or
+  DMABUF. The kernel parses each header through its own mapping,
+  bracketed by dma_buf_begin/end_cpu_access() for imported buffers.
+- CAPTURE gives MB32-tiled pictures: V4L2_PIX_FMT_NV12_32L32 for 4:2:0
+  and a new driver-private V4L2_PIX_FMT_CEDRUS_NV16_32L32 ('ST16',
+  uapi/cedrus-dec.h) for 4:2:2, the format UVC cameras send, and for
+  4:4:4, whose chroma the VE halves horizontally by averaging column
+  pairs. The display engine scans both out directly; the VE has no
+  linear JPEG output.
+- Accepted: 8-bit baseline/extended sequential 4:2:0, 4:2:2 (h2v1) and
+  4:4:4 in one interleaved scan, restart intervals, 16x16 to 4096x4096.
+  Rejected: other samplings (the VE decodes 4:1:1 into a layout of its
+  own and leaves the buffer untouched for gray), different Cb/Cr
+  tables, oversubscribed or oversized Huffman tables, and scans that do
+  not end with EOI (the VE then waits for more data and never
+  finishes). Such frames and VE errors complete with
+  V4L2_BUF_FLAG_ERROR; a VE error resets the VE.
+- The first valid frame sets the picture format and raises
+  V4L2_EVENT_SOURCE_CHANGE; frames that are broken before it come back
+  at once, so a client is never stuck behind a camera's start-up
+  garbage.
+- Dynamic resolution change without losing frames: the job parses the
+  header again (an MMAP buffer can be rewritten after QBUF) and copies
+  every table the VE uses before the first register write. A valid
+  frame of another size or chroma layout is held in the queue: every
+  earlier frame has completed by then, the next CAPTURE buffer goes back
+  empty with LAST, the event announces the new format, and decoding
+  resumes after CAPTURE STREAMOFF/STREAMON or V4L2_DEC_CMD_START (which
+  refuses buffers too small for the new format). A drain requested
+  before or during the change still ends with LAST and EOS; an OUTPUT
+  restart drops a pending change.
+- The JPEG watchdog scales with the frame: 500 ms plus ~2 us per block
+  and ~61 ns per byte, 2.5x the slowest frames measured.
+- Drain (DEC_CMD_STOP, LAST, EOS), sequence numbers on both queues and
+  the compose rectangle follow dev-decoder.rst. V4L2_DEC_CMD_START now
+  also schedules the frames queued while the decoder was stopped.
+
+The TRIGGER register is written byte by byte, as the Allwinner library
+does: a single 32-bit write decodes garbage. Buffers of one page or less
+bypass the CMA pool on this platform and may land outside the VE's DMA
+window, so picture buffers are at least two pages.
+
+Decoded pictures match libjpeg's ISLOW raw planes within 1 (PSNR >= 61
+dB) on 49 test images from 16x16 to 4096x4096, with restart intervals
+from 1 to 65535; a 1024x768 4:2:2 frame takes 16 ms. A JPEG cut short
+with an EOI appended still decodes "successfully" (the VE runs through
+the missing MCUs), so damaged camera frames must also be caught by the
+UVC error flag.
+
+Tested on a Cubietruck (A20) and a Rikomagic MK802 (A10).
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/staging/media/sunxi/cedrus/Kconfig    |   1 +
+ drivers/staging/media/sunxi/cedrus/Makefile   |   3 +
+ drivers/staging/media/sunxi/cedrus/cedrus.c   |  19 +-
+ drivers/staging/media/sunxi/cedrus/cedrus.h   |   7 +-
+ .../media/sunxi/cedrus/cedrus_context.c       | 182 ++++++-
+ .../media/sunxi/cedrus/cedrus_context.h       |  20 +
+ .../staging/media/sunxi/cedrus/cedrus_dec.c   |   3 +
+ .../media/sunxi/cedrus/cedrus_dec_jpeg.c      | 274 ++++++++++
+ .../media/sunxi/cedrus/cedrus_dec_jpeg.h      |  21 +
+ .../media/sunxi/cedrus/cedrus_engine.h        |  11 +
+ .../staging/media/sunxi/cedrus/cedrus_jpeg.c  | 475 ++++++++++++++++++
+ .../staging/media/sunxi/cedrus/cedrus_jpeg.h  |  50 ++
+ .../media/sunxi/cedrus/cedrus_jpeg_hdr.c      | 253 ++++++++++
+ .../media/sunxi/cedrus/cedrus_jpeg_hdr.h      |  51 ++
+ .../staging/media/sunxi/cedrus/cedrus_proc.c  | 119 ++++-
+ .../staging/media/sunxi/cedrus/cedrus_proc.h  |  40 ++
+ .../staging/media/sunxi/cedrus/cedrus_regs.h  |  17 +
+ .../media/sunxi/cedrus/uapi/cedrus-dec.h      |  21 +
+ 18 files changed, 1543 insertions(+), 24 deletions(-)
+ create mode 100644 drivers/staging/media/sunxi/cedrus/cedrus_dec_jpeg.c
+ create mode 100644 drivers/staging/media/sunxi/cedrus/cedrus_dec_jpeg.h
+ create mode 100644 drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c
+ create mode 100644 drivers/staging/media/sunxi/cedrus/cedrus_jpeg.h
+ create mode 100644 drivers/staging/media/sunxi/cedrus/cedrus_jpeg_hdr.c
+ create mode 100644 drivers/staging/media/sunxi/cedrus/cedrus_jpeg_hdr.h
+ create mode 100644 drivers/staging/media/sunxi/cedrus/uapi/cedrus-dec.h
+
+diff --git a/drivers/staging/media/sunxi/cedrus/Kconfig b/drivers/staging/media/sunxi/cedrus/Kconfig
+index b87c720b9..936216149 100644
+--- a/drivers/staging/media/sunxi/cedrus/Kconfig
++++ b/drivers/staging/media/sunxi/cedrus/Kconfig
+@@ -7,6 +7,7 @@ config VIDEO_SUNXI_CEDRUS
+ 	select MEDIA_CONTROLLER
+ 	select VIDEOBUF2_DMA_CONTIG
+ 	select V4L2_MEM2MEM_DEV
++	select V4L2_JPEG_HELPER
+ 	select SUNXI_SRAM
+ 	help
+ 	  Support for the Allwinner Video Engine.
+diff --git a/drivers/staging/media/sunxi/cedrus/Makefile b/drivers/staging/media/sunxi/cedrus/Makefile
+index 01c5b210f..30d8af973 100644
+--- a/drivers/staging/media/sunxi/cedrus/Makefile
++++ b/drivers/staging/media/sunxi/cedrus/Makefile
+@@ -6,10 +6,13 @@ sunxi-cedrus-y = cedrus.o \
+ 		 cedrus_dec.o \
+ 		 cedrus_dec_h264.o \
+ 		 cedrus_dec_h265.o \
++		 cedrus_dec_jpeg.o \
+ 		 cedrus_dec_mpeg2.o \
+ 		 cedrus_dec_vp8.o \
+ 		 cedrus_enc.o \
+ 		 cedrus_enc_h264.o \
+ 		 cedrus_enc_rc.o \
+ 		 cedrus_engine.o \
++		 cedrus_jpeg.o \
++		 cedrus_jpeg_hdr.o \
+ 		 cedrus_proc.o
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+index 17bea818f..7cb104efb 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -25,6 +25,7 @@
+ #include "cedrus_context.h"
+ #include "cedrus_dec.h"
+ #include "cedrus_enc.h"
++#include "cedrus_jpeg.h"
+ #include "cedrus_engine.h"
+ #include "cedrus_proc.h"
+ #include "cedrus_regs.h"
+@@ -230,7 +231,7 @@ static irqreturn_t cedrus_irq(int irq, void *private)
+ 	if (status == CEDRUS_IRQ_NONE) {
+ 		/* Not ours: the job is still running, re-arm its watchdog. */
+ 		schedule_delayed_work(&cedrus_dev->watchdog_work,
+-				      msecs_to_jiffies(2000));
++				      cedrus_context_job_timeout(ctx));
+ 		return IRQ_NONE;
+ 	}
+ 
+@@ -494,6 +495,7 @@ static int cedrus_probe(struct platform_device *platform_dev)
+ 	INIT_DELAYED_WORK(&cedrus_dev->watchdog_work, cedrus_watchdog);
+ 	cedrus_dev->procs[0] = &cedrus_dev->dec;
+ 	cedrus_dev->procs[1] = &cedrus_dev->enc;
++	cedrus_dev->procs[2] = &cedrus_dev->jpeg;
+ 
+ 	ret = cedrus_resources_setup(cedrus_dev, platform_dev);
+ 	if (ret)
+@@ -511,8 +513,15 @@ static int cedrus_probe(struct platform_device *platform_dev)
+ 	if (ret)
+ 		goto error_dec;
+ 
++	ret = cedrus_jpeg_setup(cedrus_dev);
++	if (ret)
++		goto error_enc;
++
+ 	return 0;
+ 
++error_enc:
++	cedrus_enc_cleanup(cedrus_dev);
++
+ error_dec:
+ 	cedrus_dec_cleanup(cedrus_dev);
+ 
+@@ -531,6 +540,7 @@ static void cedrus_remove(struct platform_device *platform_dev)
+ 
+ 	cancel_delayed_work_sync(&cedrus_dev->watchdog_work);
+ 
++	cedrus_jpeg_cleanup(cedrus_dev);
+ 	cedrus_enc_cleanup(cedrus_dev);
+ 	cedrus_dec_cleanup(cedrus_dev);
+ 	cedrus_v4l2_cleanup(cedrus_dev);
+@@ -541,7 +551,8 @@ static const struct cedrus_variant cedrus_variant_sun4i_a10 = {
+ 	.capabilities	= CEDRUS_CAPABILITY_MPEG2_DEC |
+ 			  CEDRUS_CAPABILITY_H264_DEC |
+ 			  CEDRUS_CAPABILITY_VP8_DEC |
+-			  CEDRUS_CAPABILITY_H264_ENC,
++			  CEDRUS_CAPABILITY_H264_ENC |
++			  CEDRUS_CAPABILITY_JPEG_DEC,
+ 	.clock_mod_rate	= 320000000,
+ 	.enc_gen	= CEDRUS_ENC_GEN_A20,
+ 	.dma_window	= SZ_256M,
+@@ -558,7 +569,8 @@ static const struct cedrus_variant cedrus_variant_sun7i_a20 = {
+ 	.capabilities	= CEDRUS_CAPABILITY_MPEG2_DEC |
+ 			  CEDRUS_CAPABILITY_H264_DEC |
+ 			  CEDRUS_CAPABILITY_VP8_DEC |
+-			  CEDRUS_CAPABILITY_H264_ENC,
++			  CEDRUS_CAPABILITY_H264_ENC |
++			  CEDRUS_CAPABILITY_JPEG_DEC,
+ 	.clock_mod_rate	= 320000000,
+ 	.enc_gen	= CEDRUS_ENC_GEN_A20,
+ 	.dma_window	= SZ_256M,
+@@ -699,3 +711,4 @@ MODULE_AUTHOR("Florent Revest <florent.revest@free-electrons.com>");
+ MODULE_AUTHOR("Paul Kocialkowski <paul.kocialkowski@bootlin.com>");
+ MODULE_AUTHOR("Maxime Ripard <maxime.ripard@bootlin.com>");
+ MODULE_LICENSE("GPL v2");
++MODULE_IMPORT_NS("DMA_BUF");
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+index 0e69919a2..996931665 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -52,6 +52,7 @@ enum cedrus_codec {
+ 	CEDRUS_CODEC_H264,
+ 	CEDRUS_CODEC_H265,
+ 	CEDRUS_CODEC_VP8,
++	CEDRUS_CODEC_JPEG,
+ };
+ 
+ enum cedrus_irq_status {
+@@ -68,6 +69,7 @@ enum cedrus_capability {
+ 	CEDRUS_CAPABILITY_H265_10_DEC	= BIT(4),
+ 	CEDRUS_CAPABILITY_VP8_DEC	= BIT(5),
+ 	CEDRUS_CAPABILITY_H264_ENC	= BIT(6),
++	CEDRUS_CAPABILITY_JPEG_DEC	= BIT(7),
+ };
+ 
+ struct cedrus_context;
+@@ -97,10 +99,12 @@ struct cedrus_format {
+ 	unsigned int	pixelformat;
+ 	unsigned int	capabilities;
+ 	int		type;
++	/* ENUM_FMT text for formats unknown to the V4L2 core. */
++	const char	*description;
+ };
+ 
+ /* Video nodes (procs) of the device, see cedrus_device.procs. */
+-#define CEDRUS_PROCS_COUNT	2
++#define CEDRUS_PROCS_COUNT	3
+ 
+ struct cedrus_v4l2 {
+ 	struct v4l2_device	v4l2_dev;
+@@ -114,6 +118,7 @@ struct cedrus_device {
+ 	struct cedrus_v4l2	v4l2;
+ 	struct cedrus_proc	dec;
+ 	struct cedrus_proc	enc;
++	struct cedrus_proc	jpeg;
+ 	/* All of the above, for code that handles every node alike. */
+ 	struct cedrus_proc	*procs[CEDRUS_PROCS_COUNT];
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_context.c b/drivers/staging/media/sunxi/cedrus/cedrus_context.c
+index 48e125616..158df3e10 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_context.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_context.c
+@@ -8,6 +8,7 @@
+  * Author: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+  */
+ 
++#include <linux/dma-buf.h>
+ #include <linux/ktime.h>
+ #include <linux/reset.h>
+ #include <linux/pm_runtime.h>
+@@ -231,19 +232,65 @@ static void cedrus_context_streaming_update(struct cedrus_context *ctx,
+ 	if (!ctx->proc->stateful)
+ 		return;
+ 
++	if (ctx->proc->ops->queue_streaming)
++		ctx->proc->ops->queue_streaming(ctx, queue, start);
++
+ 	if (start) {
+ 		v4l2_m2m_update_start_streaming_state(m2m_ctx, queue);
+ 		return;
+ 	}
+ 
++	/* No job runs now: m2m cancelled it before stopping the queue. */
+ 	v4l2_m2m_update_stop_streaming_state(m2m_ctx, queue);
+ 
++	if (ctx->hold) {
++		if (V4L2_TYPE_IS_CAPTURE(queue->type)) {
++			cedrus_context_hold_resume(ctx, false);
++		} else {
++			/* A seek drops the change; the next frame announces. */
++			v4l2_m2m_clear_state(m2m_ctx);
++			vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(m2m_ctx));
++			ctx->hold = false;
++			ctx->hold_drain = false;
++		}
++	}
++
+ 	if (V4L2_TYPE_IS_OUTPUT(queue->type) && v4l2_m2m_has_stopped(m2m_ctx))
+ 		cedrus_context_eos(ctx);
+ }
+ 
++/* CPU access to coded buffers (proc coded_cpu_access) */
++
++/*
++ * Brackets kernel reads of a coded buffer: imported DMA-BUFs may be cached
++ * on the exporter's side. Process context (may sleep).
++ */
++int cedrus_context_coded_cpu_begin(struct vb2_buffer *vb2_buffer)
++{
++	if (vb2_buffer->memory != VB2_MEMORY_DMABUF)
++		return 0;
++
++	return dma_buf_begin_cpu_access(vb2_buffer->planes[0].dbuf,
++					DMA_FROM_DEVICE);
++}
++
++void cedrus_context_coded_cpu_end(struct vb2_buffer *vb2_buffer)
++{
++	if (vb2_buffer->memory == VB2_MEMORY_DMABUF)
++		dma_buf_end_cpu_access(vb2_buffer->planes[0].dbuf,
++				       DMA_FROM_DEVICE);
++}
++
+ /* Job */
+ 
++unsigned long cedrus_context_job_timeout(struct cedrus_context *ctx)
++{
++	if (ctx->job.timeout_ms)
++		return msecs_to_jiffies(ctx->job.timeout_ms);
++
++	return cedrus_engine_timeout(ctx->engine);
++}
++
+ void cedrus_context_job_finish(struct cedrus_context *ctx, int state)
+ {
+ 	struct cedrus_proc *proc = ctx->proc;
+@@ -257,18 +304,98 @@ void cedrus_context_job_finish(struct cedrus_context *ctx, int state)
+ 	if (proc->stateful) {
+ 		struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(m2m_ctx);
+ 		struct vb2_v4l2_buffer *dst = v4l2_m2m_next_dst_buf(m2m_ctx);
++		unsigned long flags;
+ 
++		spin_lock_irqsave(&ctx->state_lock, flags);
+ 		if (src && dst &&
+ 		    v4l2_m2m_is_last_draining_src_buf(m2m_ctx, src)) {
+ 			dst->flags |= V4L2_BUF_FLAG_LAST;
+ 			cedrus_context_eos(ctx);
+ 			v4l2_m2m_mark_stopped(m2m_ctx);
+ 		}
++		spin_unlock_irqrestore(&ctx->state_lock, flags);
+ 	}
+ 
+ 	v4l2_m2m_buf_done_and_job_finish(m2m_dev, m2m_ctx, state);
+ }
+ 
++/*
++ * Dynamic resolution change: the job's frame needs another picture format.
++ * Every frame before it has completed (one job per context at a time); the
++ * frame stays queued, the next picture buffer goes back empty with LAST, and
++ * the context stays stopped until the client resumes it.
++ */
++static void cedrus_context_job_hold(struct cedrus_context *ctx)
++{
++	struct v4l2_m2m_ctx *m2m_ctx = ctx->v4l2.fh.m2m_ctx;
++	struct vb2_v4l2_buffer *dst;
++	unsigned long flags;
++
++	ctx->proc->ops->job_hold(ctx, ctx->job.buffer_picture);
++
++	spin_lock_irqsave(&ctx->state_lock, flags);
++	ctx->hold = true;
++	/* last_buffer_done() ends a drain begun before: resume it later. */
++	ctx->hold_drain = m2m_ctx->is_draining;
++	dst = v4l2_m2m_dst_buf_remove(m2m_ctx);
++	/* No frame: drop what job_run copied from the waiting one. */
++	dst->vb2_buf.timestamp = 0;
++	dst->vb2_buf.copied_timestamp = 0;
++	dst->flags &= ~(V4L2_BUF_FLAG_TIMECODE | V4L2_BUF_FLAG_KEYFRAME |
++			V4L2_BUF_FLAG_PFRAME | V4L2_BUF_FLAG_BFRAME);
++	vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
++	v4l2_m2m_last_buffer_done(m2m_ctx, dst);
++	spin_unlock_irqrestore(&ctx->state_lock, flags);
++
++	memset(&ctx->job, 0, sizeof(ctx->job));
++	v4l2_m2m_job_finish(ctx->proc->dev->v4l2.m2m_dev, m2m_ctx);
++}
++
++/*
++ * The client resumes after a hold: CAPTURE STREAMOFF (command false; the m2m
++ * state was cleared) or V4L2_DEC_CMD_START (command true; the picture buffers
++ * must fit the new format). The picture format follows the stream again.
++ */
++int cedrus_context_hold_resume(struct cedrus_context *ctx, bool command)
++{
++	struct v4l2_m2m_ctx *m2m_ctx = ctx->v4l2.fh.m2m_ctx;
++	struct vb2_queue *queue = v4l2_m2m_get_dst_vq(m2m_ctx);
++	struct v4l2_format format;
++	unsigned long flags;
++	unsigned int i;
++
++	if (!ctx->hold)
++		return 0;
++
++	if (command) {
++		ctx->proc->ops->format_picture_get(ctx, &format);
++		for (i = 0; i < queue->max_num_buffers; i++) {
++			struct vb2_buffer *vb2_buffer = vb2_get_buffer(queue, i);
++
++			if (vb2_buffer && vb2_plane_size(vb2_buffer, 0) <
++			    format.fmt.pix.sizeimage)
++				return -EINVAL;
++		}
++	}
++
++	ctx->proc->ops->format_picture_adopt(ctx);
++
++	spin_lock_irqsave(&ctx->state_lock, flags);
++	if (command)
++		m2m_ctx->has_stopped = false;
++	m2m_ctx->is_draining = ctx->hold_drain;
++	ctx->hold = false;
++	ctx->hold_drain = false;
++	spin_unlock_irqrestore(&ctx->state_lock, flags);
++
++	if (command) {
++		vb2_clear_last_buffer_dequeued(queue);
++		v4l2_m2m_try_schedule(m2m_ctx);
++	}
++
++	return 0;
++}
++
+ int cedrus_context_job_run(struct cedrus_context *ctx)
+ {
+ 	struct cedrus_proc *proc = ctx->proc;
+@@ -362,8 +489,15 @@ int cedrus_context_job_run(struct cedrus_context *ctx)
+ 	/* Configure engine job. */
+ 
+ 	ret = cedrus_engine_job_configure(ctx);
++	if (ret == -EAGAIN && proc->ops->job_hold) {
++		cedrus_context_job_hold(ctx);
++		return 0;
++	}
+ 	if (ret) {
+-		v4l2_err(v4l2_dev, "failed to configure engine job: %d\n", ret);
++		/* -EBADMSG: a broken frame, reported through the buffer only. */
++		if (ret != -EBADMSG)
++			v4l2_err(v4l2_dev, "failed to configure engine job: %d\n",
++				 ret);
+ 		goto error_ctrl;
+ 	}
+ 
+@@ -379,7 +513,7 @@ int cedrus_context_job_run(struct cedrus_context *ctx)
+ 	/* Schedule the global watchdog. */
+ 
+ 	schedule_delayed_work(&cedrus_dev->watchdog_work,
+-			      msecs_to_jiffies(2000));
++			      cedrus_context_job_timeout(ctx));
+ 
+ 	/* Trigger engine job. */
+ 
+@@ -555,6 +689,14 @@ static int cedrus_context_buffer_prepare(struct vb2_buffer *vb2_buffer)
+ 	if (vb2_plane_size(vb2_buffer, 0) < pix_format->sizeimage)
+ 		return -EINVAL;
+ 
++	/* The kernel reads the bitstream (cedrus_context_coded_cpu_begin). */
++	if (format_type == CEDRUS_FORMAT_TYPE_CODED &&
++	    ctx->proc->coded_cpu_access && !vb2_plane_vaddr(vb2_buffer, 0)) {
++		dev_err_ratelimited(ctx->proc->dev->dev,
++				    "bitstream buffer without a kernel mapping\n");
++		return -EINVAL;
++	}
++
+ 	/* Also catches DMABUF imports the VE could not reach. */
+ 	if (!cedrus_dma_in_window(ctx->proc->dev,
+ 				  vb2_dma_contig_plane_dma_addr(vb2_buffer, 0),
+@@ -578,9 +720,15 @@ static void cedrus_context_buffer_queue(struct vb2_buffer *vb2_buffer)
+ 	struct v4l2_m2m_ctx *m2m_ctx = ctx->v4l2.fh.m2m_ctx;
+ 
+ 	if (cedrus_proc_format_type(ctx->proc, vb2_buffer->type) ==
+-	    CEDRUS_FORMAT_TYPE_CODED)
+-		cedrus_engine_buffer_coded_queue(ctx,
+-						 cedrus_buffer_from_vb2(vb2_buffer));
++	    CEDRUS_FORMAT_TYPE_CODED) {
++		struct cedrus_buffer *buffer = cedrus_buffer_from_vb2(vb2_buffer);
++
++		cedrus_engine_buffer_coded_queue(ctx, buffer);
++
++		if (ctx->proc->ops->buffer_coded_queue &&
++		    ctx->proc->ops->buffer_coded_queue(ctx, buffer))
++			return;
++	}
+ 
+ 	if (ctx->proc->stateful &&
+ 	    V4L2_TYPE_IS_CAPTURE(vb2_buffer->vb2_queue->type) &&
+@@ -761,6 +909,10 @@ static int cedrus_context_queue_init(void *private, struct vb2_queue *src_queue,
+ 	src_queue->dma_attrs = CEDRUS_HW_BUF_ATTRS;
+ 	src_queue->drv_priv = ctx;
+ 
++	/* The kernel parses the bitstream through its own mapping. */
++	if (proc->coded_cpu_access)
++		src_queue->dma_attrs = 0;
++
+ 	/* Stateless decoding passes every frame's parameters in a request. */
+ 	src_queue->requires_requests = !proc->stateful;
+ 
+@@ -798,6 +950,13 @@ int cedrus_context_setup(struct cedrus_proc *proc, struct cedrus_context *ctx,
+ 
+ 	ctx->proc = proc;
+ 	ctx->engine = proc->engines[0];
++	spin_lock_init(&ctx->state_lock);
++
++	if (proc->ops->context_setup) {
++		ret = proc->ops->context_setup(ctx);
++		if (ret)
++			return ret;
++	}
+ 
+ 	/* V4L2 File Handler */
+ 
+@@ -810,7 +969,8 @@ int cedrus_context_setup(struct cedrus_proc *proc, struct cedrus_context *ctx,
+ 	if (IS_ERR(fh->m2m_ctx)) {
+ 		v4l2_err(v4l2_dev, "failed to initialize V4L2 M2M context\n");
+ 		v4l2_fh_exit(fh);
+-		return PTR_ERR(fh->m2m_ctx);
++		ret = PTR_ERR(fh->m2m_ctx);
++		goto error_proc;
+ 	}
+ 
+ 	/* Ctrls */
+@@ -838,13 +998,16 @@ int cedrus_context_setup(struct cedrus_proc *proc, struct cedrus_context *ctx,
+ 	v4l2_m2m_ctx_release(fh->m2m_ctx);
+ 	cedrus_context_ctrls_cleanup(ctx);
+ 	v4l2_fh_exit(fh);
+-
+-	return ret;
++	goto error_proc;
+ 
+ error_v4l2_m2m:
+ 	v4l2_m2m_ctx_release(fh->m2m_ctx);
+ 	v4l2_fh_exit(fh);
+ 
++error_proc:
++	if (proc->ops->context_cleanup)
++		proc->ops->context_cleanup(ctx);
++
+ 	return ret;
+ }
+ 
+@@ -863,4 +1026,7 @@ void cedrus_context_cleanup(struct cedrus_context *ctx, struct file *file)
+ 	v4l2_m2m_ctx_release(fh->m2m_ctx);
+ 	cedrus_context_ctrls_cleanup(ctx);
+ 	v4l2_fh_exit(fh);
++
++	if (ctx->proc->ops->context_cleanup)
++		ctx->proc->ops->context_cleanup(ctx);
+ }
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_context.h b/drivers/staging/media/sunxi/cedrus/cedrus_context.h
+index 4cf78b2cd..2457a0b3b 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_context.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_context.h
+@@ -26,6 +26,9 @@ struct cedrus_job {
+ 
+ 	struct vb2_v4l2_buffer	*buffer_coded;
+ 	struct vb2_v4l2_buffer	*buffer_picture;
++
++	/* Watchdog for this job if the engine sets it, else the engine's. */
++	unsigned int		timeout_ms;
+ };
+ 
+ struct cedrus_buffer {
+@@ -55,10 +58,23 @@ struct cedrus_context {
+ 	void				*engine_ctx;
+ 	void				*engine_job;
+ 
++	/* Node state (cedrus_proc_ops.context_setup). */
++	void				*proc_ctx;
++
+ 	struct cedrus_context_v4l2	v4l2;
+ 	struct cedrus_job		job;
+ 
+ 	unsigned int			bit_depth_coded;
++
++	/*
++	 * Stateful decoders: the m2m stop/drain state changes from the job
++	 * (hold, LAST) and from DECODER_CMD; this lock orders the two.
++	 */
++	spinlock_t			state_lock;
++	/* A frame waits for the picture format it announced (resolution change). */
++	bool				hold;
++	/* A drain to resume when the hold ends (m2m's ends with the LAST). */
++	bool				hold_drain;
+ };
+ 
+ static inline void cedrus_buffer_picture_dma(struct cedrus_context *ctx,
+@@ -156,6 +172,10 @@ int cedrus_context_selection_picture_reset(struct cedrus_context *ctx);
+ /* Job */
+ 
+ void cedrus_context_job_finish(struct cedrus_context *ctx, int state);
++int cedrus_context_coded_cpu_begin(struct vb2_buffer *vb2_buffer);
++void cedrus_context_coded_cpu_end(struct vb2_buffer *vb2_buffer);
++unsigned long cedrus_context_job_timeout(struct cedrus_context *ctx);
++int cedrus_context_hold_resume(struct cedrus_context *ctx, bool command);
+ int cedrus_context_job_run(struct cedrus_context *ctx);
+ 
+ /* Queue */
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+index 737d49271..2639ae3dc 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+@@ -73,6 +73,9 @@ int cedrus_dec_format_coded_configure(struct cedrus_context *ctx)
+ 
+ 	switch (pix_format->pixelformat) {
+ 	case V4L2_PIX_FMT_MPEG2_SLICE:
++	case V4L2_PIX_FMT_JPEG:
++	case V4L2_PIX_FMT_MJPEG:
++		/* JPEG runs on the MPEG engine. */
+ 		value |= VE_MODE_DEC_MPEG;
+ 		break;
+ 	case V4L2_PIX_FMT_H264_SLICE:
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_dec_jpeg.c b/drivers/staging/media/sunxi/cedrus/cedrus_dec_jpeg.c
+new file mode 100644
+index 000000000..5c4e51b21
+--- /dev/null
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec_jpeg.c
+@@ -0,0 +1,274 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Cedrus Video Engine Driver
++ *
++ * JPEG decoding on the MPEG engine of the A10/A20 VE (baseline 4:2:0, 4:2:2
++ * and 4:4:4, restart intervals). Register sequence after Allwinner's
++ * libvecore (InitJpegHw/JpegHwDec), mjpeg_hal.c and Jens Kuske's jpeg-test,
++ * verified on the A20.
++ */
++
++#include <linux/io.h>
++#include <linux/types.h>
++#include <linux/videodev2.h>
++
++#include "cedrus.h"
++#include "cedrus_context.h"
++#include "cedrus_dec.h"
++#include "cedrus_dec_jpeg.h"
++#include "cedrus_engine.h"
++#include "cedrus_jpeg.h"
++#include "cedrus_proc.h"
++#include "cedrus_regs.h"
++
++/*
++ * Watchdog base: a stalled VLD (a scan without EOI) must not block the VE
++ * for long; job_configure adds time for the frame size.
++ */
++#define CEDRUS_DEC_JPEG_TIMEOUT_MS	500
++
++/* Job */
++
++static int cedrus_dec_jpeg_job_configure(struct cedrus_context *ctx)
++{
++	struct cedrus_device *dev = ctx->proc->dev;
++	struct cedrus_dec_jpeg_job *job = ctx->engine_job;
++	struct cedrus_jpeg_hdr *hdr = &job->hdr;
++	struct v4l2_pix_format *pix_format = &ctx->v4l2.format_picture.fmt.pix;
++	struct v4l2_rect *visible = &ctx->v4l2.selection_picture;
++	struct vb2_buffer *vb2_buffer = &ctx->job.buffer_coded->vb2_buf;
++	dma_addr_t luma_addr, chroma_addr, coded_addr;
++	unsigned int coded_size, i, k;
++	void *vaddr;
++	int ret;
++
++	/*
++	 * Parse again: userspace may have rewritten the buffer since it was
++	 * queued. Everything is checked and copied before the first register
++	 * write; a bad frame completes with an error and leaves the VE alone.
++	 */
++	vaddr = vb2_plane_vaddr(vb2_buffer, 0);
++	cedrus_job_buffer_coded_dma(ctx, &coded_addr, &coded_size);
++	if (!vaddr || !coded_size)
++		return -EBADMSG;
++
++	ret = cedrus_context_coded_cpu_begin(vb2_buffer);
++	if (ret)
++		return ret;
++	ret = cedrus_jpeg_hdr_parse(vaddr, coded_size, CEDRUS_JPEG_WIDTH_MAX,
++				    CEDRUS_JPEG_HEIGHT_MAX, hdr);
++	cedrus_context_coded_cpu_end(vb2_buffer);
++	if (ret)
++		return -EBADMSG;
++
++	/*
++	 * Frames of another size or chroma format wait until the client has
++	 * picture buffers for them (resolution change, cedrus_jpeg_job_hold).
++	 */
++	if (hdr->width != visible->width || hdr->height != visible->height ||
++	    cedrus_jpeg_picture_fourcc(hdr->format) != pix_format->pixelformat)
++		return -EAGAIN;
++
++	/* VLD_ADDR drops address bits 3:0. */
++	if (coded_addr & 0xf)
++		return -EINVAL;
++
++	/* The picture buffer holds the whole aligned picture (defensive). */
++	if (vb2_plane_size(&ctx->job.buffer_picture->vb2_buf, 0) <
++	    pix_format->sizeimage ||
++	    ALIGN(hdr->width, 32) > pix_format->width ||
++	    ALIGN(hdr->height, 32) > pix_format->height)
++		return -EINVAL;
++
++	cedrus_jpeg_hdr_sram(hdr, job->sram);
++
++	/* Restart interval and chroma format: TRIGGER byte 3. */
++
++	cedrus_write(dev, VE_DEC_MPEG_JPEG_RES_INT, hdr->restart_interval);
++
++	/*
++	 * The TRIGGER bytes are written one at a time, as the Allwinner
++	 * library does: a single 32-bit write decodes garbage.
++	 */
++	writeb(hdr->format << 3 | 3, dev->io_base + VE_DEC_MPEG_TRIGGER + 3);
++
++	/* Quantisation tables in DQT order: luma intra, chroma non-intra. */
++
++	for (i = 0; i < 2; i++)
++		for (k = 0; k < 64; k++)
++			cedrus_write(dev, VE_DEC_MPEG_IQMINPUT,
++				     VE_DEC_MPEG_IQMINPUT_WEIGHT(k, hdr->qt[i][k]) |
++				     (i ? VE_DEC_MPEG_IQMINPUT_FLAG_NON_INTRA :
++					  VE_DEC_MPEG_IQMINPUT_FLAG_INTRA));
++
++	/* Output: MB32-tiled luma and interleaved chroma. */
++
++	cedrus_job_buffer_picture_dma(ctx, &luma_addr, &chroma_addr);
++	cedrus_write(dev, VE_DEC_MPEG_ROT_LUMA, luma_addr);
++	cedrus_write(dev, VE_DEC_MPEG_ROT_CHROMA, chroma_addr);
++
++	cedrus_write(dev, VE_DEC_MPEG_JPEG_SIZE,
++		     VE_DEC_MPEG_JPEG_SIZE_WIDTH(hdr->mcu_width - 1) |
++		     VE_DEC_MPEG_JPEG_SIZE_HEIGHT(hdr->mcu_height - 1));
++
++	cedrus_write(dev, VE_DEC_MPEG_SDROT_CTRL, 0);
++
++	/* Huffman tables. */
++
++	cedrus_write(dev, VE_DEC_MPEG_SRAM_RW_OFFSET, 0);
++	for (i = 0; i < CEDRUS_JPEG_SRAM_WORDS; i++)
++		cedrus_write(dev, VE_DEC_MPEG_SRAM_RW_DATA,
++			     le32_to_cpu(((__le32 *)job->sram)[i]));
++
++	/* Bitstream: the whole buffer, decoding starts at the scan data. */
++
++	cedrus_write(dev, VE_DEC_MPEG_VLD_END_ADDR, coded_addr + coded_size - 1);
++
++	/* Written, not OR-ed: MPEG-2 leaves MC_NO_WRITEBACK/MC_CACHE_EN set. */
++	cedrus_write(dev, VE_DEC_MPEG_CTRL, VE_DEC_MPEG_CTRL_JPEG_IRQ_MASK);
++
++	cedrus_write(dev, VE_DEC_MPEG_VLD_OFFSET, hdr->ecs_offset * 8);
++	cedrus_write(dev, VE_DEC_MPEG_VLD_LEN,
++		     (coded_size - hdr->ecs_offset) * 8);
++	cedrus_write(dev, VE_DEC_MPEG_VLD_ADDR,
++		     VE_DEC_MPEG_VLD_ADDR_BASE(coded_addr) |
++		     VE_DEC_MPEG_VLD_ADDR_VALID_PIC_DATA |
++		     VE_DEC_MPEG_VLD_ADDR_LAST_PIC_DATA |
++		     VE_DEC_MPEG_VLD_ADDR_FIRST_PIC_DATA);
++
++	cedrus_write(dev, VE_DEC_MPEG_STATUS, VE_DEC_MPEG_STATUS_JPEG_CLEAR);
++
++	/*
++	 * Photos take ~0.72 us per block, bit-bound frames ~32 ns per byte
++	 * (4096x4096 4:2:0 noise at q100, 33 MB: 1.06 s). Allow ~2 us per
++	 * block plus ~61 ns per byte, i.e. 2.5x or more.
++	 */
++	ctx->job.timeout_ms = CEDRUS_DEC_JPEG_TIMEOUT_MS +
++			      hdr->mcu_width * hdr->mcu_height *
++			      hdr->mcu_blocks / 512 + coded_size / 16384;
++
++	return 0;
++}
++
++static void cedrus_dec_jpeg_job_trigger(struct cedrus_context *ctx)
++{
++	struct cedrus_device *dev = ctx->proc->dev;
++
++	writeb(VE_DEC_MPEG_TRIGGER_HW_JPEG_VLD,
++	       dev->io_base + VE_DEC_MPEG_TRIGGER);
++}
++
++static int cedrus_dec_jpeg_job_finish(struct cedrus_context *ctx, int state)
++{
++	struct cedrus_jpeg_context *jpeg_ctx = ctx->proc_ctx;
++	u32 sequence = jpeg_ctx->sequence++;
++
++	ctx->job.buffer_coded->sequence = sequence;
++	ctx->job.buffer_picture->sequence = sequence;
++
++	/* The buffer may have been prepared for the format before a change. */
++	vb2_set_plane_payload(&ctx->job.buffer_picture->vb2_buf, 0,
++			      ctx->v4l2.format_picture.fmt.pix.sizeimage);
++
++	return state;
++}
++
++/* IRQ */
++
++static int cedrus_dec_jpeg_irq_status(struct cedrus_context *ctx)
++{
++	struct cedrus_device *dev = ctx->proc->dev;
++	u32 status = cedrus_read(dev, VE_DEC_MPEG_STATUS);
++
++	/* Marker/restart/bit-end errors may come without bits 3:0. */
++	if (!(status & (VE_DEC_MPEG_STATUS_CHECK_MASK |
++			VE_DEC_MPEG_STATUS_ROTATE_SUCCESS |
++			VE_DEC_MPEG_STATUS_JPEG_ERRORS)))
++		return CEDRUS_IRQ_NONE;
++
++	if (status & VE_DEC_MPEG_STATUS_SUCCESS &&
++	    !(status & (VE_DEC_MPEG_STATUS_CHECK_ERROR |
++			VE_DEC_MPEG_STATUS_JPEG_ERRORS)))
++		return CEDRUS_IRQ_SUCCESS;
++
++	dev_dbg_ratelimited(dev->dev, "jpeg: decode error, status %08x\n",
++			    status);
++
++	return CEDRUS_IRQ_ERROR;
++}
++
++static void cedrus_dec_jpeg_irq_clear(struct cedrus_context *ctx)
++{
++	struct cedrus_device *dev = ctx->proc->dev;
++
++	cedrus_write(dev, VE_DEC_MPEG_STATUS, VE_DEC_MPEG_STATUS_CHECK_MASK |
++		     VE_DEC_MPEG_STATUS_ROTATE_SUCCESS);
++}
++
++static void cedrus_dec_jpeg_irq_disable(struct cedrus_context *ctx)
++{
++	struct cedrus_device *dev = ctx->proc->dev;
++	u32 value;
++
++	value = cedrus_read(dev, VE_DEC_MPEG_CTRL);
++	value &= ~VE_DEC_MPEG_CTRL_JPEG_IRQ_MASK;
++
++	cedrus_write(dev, VE_DEC_MPEG_CTRL, value);
++}
++
++/* Engine */
++
++static const struct cedrus_engine_ops cedrus_dec_jpeg_ops = {
++	.format_prepare		= cedrus_jpeg_format_coded_prepare,
++	.format_configure	= cedrus_dec_format_coded_configure,
++	.format_picture_update	= cedrus_jpeg_format_picture_update,
++
++	.job_configure		= cedrus_dec_jpeg_job_configure,
++	.job_trigger		= cedrus_dec_jpeg_job_trigger,
++	.job_finish		= cedrus_dec_jpeg_job_finish,
++
++	.irq_status		= cedrus_dec_jpeg_irq_status,
++	.irq_clear		= cedrus_dec_jpeg_irq_clear,
++	.irq_disable		= cedrus_dec_jpeg_irq_disable,
++};
++
++static const struct v4l2_frmsize_stepwise cedrus_dec_jpeg_frmsize = {
++	.min_width	= 16,
++	.max_width	= CEDRUS_JPEG_WIDTH_MAX,
++	.step_width	= 1,
++
++	.min_height	= 16,
++	.max_height	= CEDRUS_JPEG_HEIGHT_MAX,
++	.step_height	= 1,
++};
++
++const struct cedrus_engine cedrus_dec_jpeg = {
++	.codec			= CEDRUS_CODEC_JPEG,
++	.role			= CEDRUS_ROLE_DECODER,
++	.capabilities		= CEDRUS_CAPABILITY_JPEG_DEC,
++
++	.ops			= &cedrus_dec_jpeg_ops,
++
++	.pixelformat		= V4L2_PIX_FMT_JPEG,
++	.reset_on_error		= true,
++	.timeout_ms		= CEDRUS_DEC_JPEG_TIMEOUT_MS,
++	.frmsize		= &cedrus_dec_jpeg_frmsize,
++
++	.job_size		= sizeof(struct cedrus_dec_jpeg_job),
++};
++
++/* UVC cameras: the same frames, often without DHT (standard tables). */
++const struct cedrus_engine cedrus_dec_mjpeg = {
++	.codec			= CEDRUS_CODEC_JPEG,
++	.role			= CEDRUS_ROLE_DECODER,
++	.capabilities		= CEDRUS_CAPABILITY_JPEG_DEC,
++
++	.ops			= &cedrus_dec_jpeg_ops,
++
++	.pixelformat		= V4L2_PIX_FMT_MJPEG,
++	.reset_on_error		= true,
++	.timeout_ms		= CEDRUS_DEC_JPEG_TIMEOUT_MS,
++	.frmsize		= &cedrus_dec_jpeg_frmsize,
++
++	.job_size		= sizeof(struct cedrus_dec_jpeg_job),
++};
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_dec_jpeg.h b/drivers/staging/media/sunxi/cedrus/cedrus_dec_jpeg.h
+new file mode 100644
+index 000000000..3ab36d7d9
+--- /dev/null
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec_jpeg.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Cedrus Video Engine Driver
++ *
++ * JPEG decoding on the MPEG engine of the A10/A20 VE.
++ */
++
++#ifndef _CEDRUS_DEC_JPEG_H_
++#define _CEDRUS_DEC_JPEG_H_
++
++#include "cedrus_jpeg_hdr.h"
++
++struct cedrus_dec_jpeg_job {
++	struct cedrus_jpeg_hdr	hdr;
++	u8			sram[CEDRUS_JPEG_SRAM_WORDS * 4];
++};
++
++extern const struct cedrus_engine cedrus_dec_jpeg;
++extern const struct cedrus_engine cedrus_dec_mjpeg;
++
++#endif
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_engine.h b/drivers/staging/media/sunxi/cedrus/cedrus_engine.h
+index 774a937df..90343ce47 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_engine.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_engine.h
+@@ -9,6 +9,7 @@
+ #ifndef _CEDRUS_ENGINE_H_
+ #define _CEDRUS_ENGINE_H_
+ 
++#include <linux/jiffies.h>
+ #include <linux/videodev2.h>
+ #include <media/v4l2-ctrls.h>
+ 
+@@ -70,6 +71,8 @@ struct cedrus_engine {
+ 	bool					slice_based;
+ 	/* Reset the VE when a job of this engine ends with an error IRQ. */
+ 	bool					reset_on_error;
++	/* Watchdog for one job, 0 = CEDRUS_WATCHDOG_MS. */
++	unsigned int				timeout_ms;
+ 
+ 	const struct v4l2_ctrl_config		*ctrl_configs;
+ 	unsigned int				ctrl_configs_count;
+@@ -81,6 +84,14 @@ struct cedrus_engine {
+ 	unsigned int				buffer_size;
+ };
+ 
++#define CEDRUS_WATCHDOG_MS	2000
++
++static inline unsigned long
++cedrus_engine_timeout(const struct cedrus_engine *engine)
++{
++	return msecs_to_jiffies(engine->timeout_ms ?: CEDRUS_WATCHDOG_MS);
++}
++
+ /* Frame size */
+ 
+ const struct v4l2_frmsize_stepwise *
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c b/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c
+new file mode 100644
+index 000000000..8490c2239
+--- /dev/null
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c
+@@ -0,0 +1,475 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Cedrus Video Engine Driver
++ *
++ * Stateful JPEG decoder node (cedrus-jpeg), following
++ * Documentation/userspace-api/media/v4l/dev-decoder.rst: the driver reads the
++ * picture size from the frames, signals it with V4L2_EVENT_SOURCE_CHANGE and
++ * decodes into MB32-tiled pictures (NV12 for 4:2:0, the driver-private NV16
++ * layout for 4:2:2 and 4:4:4, whose chroma the VE halves horizontally by
++ * averaging column pairs). Broken frames come back with V4L2_BUF_FLAG_ERROR.
++ */
++
++#include <linux/slab.h>
++#include <linux/types.h>
++#include <linux/videodev2.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-mem2mem.h>
++
++#include "cedrus.h"
++#include "cedrus_context.h"
++#include "cedrus_dec.h"
++#include "cedrus_dec_jpeg.h"
++#include "cedrus_engine.h"
++#include "cedrus_jpeg.h"
++#include "cedrus_proc.h"
++#include "cedrus_regs.h"
++#include "uapi/cedrus-dec.h"
++
++/* Format */
++
++static const struct cedrus_format cedrus_jpeg_formats[] = {
++	{
++		.pixelformat	= V4L2_PIX_FMT_NV12_32L32,
++		.type		= CEDRUS_FORMAT_TYPE_PICTURE,
++	},
++	{
++		.pixelformat	= V4L2_PIX_FMT_CEDRUS_NV16_32L32,
++		.type		= CEDRUS_FORMAT_TYPE_PICTURE,
++		.description	= "Y/UV 4:2:2 (32x32 Tiles)",
++	},
++};
++
++u32 cedrus_jpeg_picture_fourcc(unsigned int format)
++{
++	return format == CEDRUS_JPEG_FMT_420 ? V4L2_PIX_FMT_NV12_32L32 :
++					       V4L2_PIX_FMT_CEDRUS_NV16_32L32;
++}
++
++/*
++ * The client's colorimetry wins; without one, the V4L2_COLORSPACE_JPEG
++ * shorthand (the other fields stay 0).
++ */
++static void cedrus_jpeg_colorimetry(struct v4l2_pix_format *pix_format)
++{
++	pix_format->field = V4L2_FIELD_NONE;
++
++	if (pix_format->colorspace != V4L2_COLORSPACE_DEFAULT)
++		return;
++
++	pix_format->colorspace = V4L2_COLORSPACE_JPEG;
++	pix_format->xfer_func = V4L2_XFER_FUNC_DEFAULT;
++	pix_format->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
++	pix_format->quantization = V4L2_QUANTIZATION_DEFAULT;
++}
++
++static void cedrus_jpeg_picture_fill(struct cedrus_context *ctx,
++				     struct v4l2_pix_format *pix_format,
++				     unsigned int width, unsigned int height,
++				     u32 pixelformat)
++{
++	struct v4l2_pix_format *pix_format_coded =
++		&ctx->v4l2.format_coded.fmt.pix;
++
++	unsigned int stride = ALIGN(width, 32);
++	unsigned int rows = ALIGN(height, 32);
++
++	pix_format->pixelformat = pixelformat;
++	pix_format->width = stride;
++	pix_format->height = rows;
++	pix_format->bytesperline = stride;
++
++	if (pixelformat == V4L2_PIX_FMT_NV12_32L32)
++		/* As the other decoders: chroma rows rounded to 64. */
++		pix_format->sizeimage = stride * rows +
++					stride * ALIGN(rows, 64) / 2;
++	else
++		/* Full-height chroma; the VE never writes past it (J2). */
++		pix_format->sizeimage = 2 * stride * rows;
++
++	/*
++	 * Allocations of one page or less bypass the CMA pool and may land
++	 * outside the VE's DMA window (refused by buf_prepare).
++	 */
++	pix_format->sizeimage = max_t(u32, pix_format->sizeimage,
++				      2 * PAGE_SIZE);
++
++	/* Colorimetry follows the coded format; JPEG means sRGB, 601, full. */
++	pix_format->field = V4L2_FIELD_NONE;
++	if (pix_format_coded->colorspace == V4L2_COLORSPACE_JPEG) {
++		pix_format->colorspace = V4L2_COLORSPACE_SRGB;
++		pix_format->xfer_func = V4L2_XFER_FUNC_SRGB;
++		pix_format->ycbcr_enc = V4L2_YCBCR_ENC_601;
++		pix_format->quantization = V4L2_QUANTIZATION_FULL_RANGE;
++	} else {
++		pix_format->colorspace = pix_format_coded->colorspace;
++		pix_format->xfer_func = pix_format_coded->xfer_func;
++		pix_format->ycbcr_enc = pix_format_coded->ycbcr_enc;
++		pix_format->quantization = pix_format_coded->quantization;
++	}
++}
++
++/* Size and fourcc the picture queue should have now. */
++static void cedrus_jpeg_picture_target(struct cedrus_context *ctx,
++				       unsigned int *width,
++				       unsigned int *height, u32 *pixelformat)
++{
++	struct cedrus_jpeg_context *jpeg_ctx = ctx->proc_ctx;
++	struct v4l2_pix_format *pix_format_coded =
++		&ctx->v4l2.format_coded.fmt.pix;
++	unsigned long flags;
++
++	spin_lock_irqsave(&jpeg_ctx->lock, flags);
++	if (jpeg_ctx->announced) {
++		*width = jpeg_ctx->width;
++		*height = jpeg_ctx->height;
++		*pixelformat = jpeg_ctx->pixelformat;
++	} else {
++		*width = pix_format_coded->width;
++		*height = pix_format_coded->height;
++	}
++	spin_unlock_irqrestore(&jpeg_ctx->lock, flags);
++}
++
++int cedrus_jpeg_format_coded_prepare(struct cedrus_context *ctx,
++				     struct v4l2_format *format)
++{
++	struct v4l2_pix_format *pix_format = &format->fmt.pix;
++
++	v4l2_apply_frmsize_constraints(&pix_format->width, &pix_format->height,
++				       ctx->engine->frmsize);
++
++	/*
++	 * Room for a frame at 12 bits per pixel, up to 8 MiB: at 4096x4096
++	 * that floor alone would take 24 MiB per buffer of the CMA pool.
++	 * Clients with bigger frames ask for more.
++	 */
++	pix_format->bytesperline = 0;
++	pix_format->sizeimage = max3(pix_format->sizeimage,
++				     min(pix_format->width * pix_format->height *
++					 3 / 2, (u32)SZ_8M),
++				     (u32)SZ_64K);
++
++	cedrus_jpeg_colorimetry(pix_format);
++
++	return 0;
++}
++
++/* Visible part of the picture the stream asks for (G_SELECTION). */
++static void cedrus_jpeg_selection_picture_get(struct cedrus_context *ctx,
++					      struct v4l2_rect *visible)
++{
++	u32 pixelformat = V4L2_PIX_FMT_NV12_32L32;
++	unsigned int width, height;
++
++	cedrus_jpeg_picture_target(ctx, &width, &height, &pixelformat);
++
++	visible->left = 0;
++	visible->top = 0;
++	visible->width = width;
++	visible->height = height;
++}
++
++/*
++ * The engine hook after S_FMT on the picture queue: the visible size jobs
++ * are checked against follows the picture format.
++ */
++void cedrus_jpeg_format_picture_update(struct cedrus_context *ctx)
++{
++	cedrus_jpeg_selection_picture_get(ctx, &ctx->v4l2.selection_picture);
++}
++
++static int cedrus_jpeg_format_picture_prepare(struct cedrus_context *ctx,
++					      struct v4l2_format *format)
++{
++	struct v4l2_pix_format *pix_format = &format->fmt.pix;
++	unsigned int width, height;
++	u32 pixelformat = pix_format->pixelformat;
++
++	/* Once the stream is known, its picture format is the only choice. */
++	cedrus_jpeg_picture_target(ctx, &width, &height, &pixelformat);
++	cedrus_jpeg_picture_fill(ctx, pix_format, width, height, pixelformat);
++
++	return 0;
++}
++
++static int cedrus_jpeg_format_picture_configure(struct cedrus_context *ctx)
++{
++	struct cedrus_device *dev = ctx->proc->dev;
++
++	/* The JPEG engine takes the chroma layout from the TRIGGER format. */
++	cedrus_write(dev, VE_PRIMARY_OUT_FMT, VE_PRIMARY_OUT_FMT_TILED_32_NV12);
++	cedrus_write(dev, VE_CHROMA_BUF_LEN, VE_SECONDARY_OUT_FMT_TILED_32_NV12);
++
++	return 0;
++}
++
++static void cedrus_jpeg_format_picture_get(struct cedrus_context *ctx,
++					   struct v4l2_format *format)
++{
++	*format = ctx->v4l2.format_picture;
++	cedrus_jpeg_format_picture_prepare(ctx, format);
++}
++
++/*
++ * job_run and queue_setup read format_picture: it follows the announced
++ * format while the picture queue has no buffers, and when the client resumes
++ * after a resolution change (no job runs then).
++ */
++static void cedrus_jpeg_format_picture_adopt(struct cedrus_context *ctx)
++{
++	cedrus_jpeg_format_picture_prepare(ctx, &ctx->v4l2.format_picture);
++	cedrus_jpeg_format_picture_update(ctx);
++}
++
++static void cedrus_jpeg_format_picture_sync(struct cedrus_context *ctx)
++{
++	if (!cedrus_context_queue_busy_check(ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE))
++		cedrus_jpeg_format_picture_adopt(ctx);
++}
++
++static int cedrus_jpeg_format_setup(struct cedrus_context *ctx)
++{
++	struct cedrus_proc *proc = ctx->proc;
++	struct v4l2_format *format = &ctx->v4l2.format_coded;
++	struct v4l2_pix_format *pix_format = &format->fmt.pix;
++	int ret;
++
++	format->type = cedrus_proc_buffer_type(proc, CEDRUS_FORMAT_TYPE_CODED);
++
++	pix_format->pixelformat = ctx->engine->pixelformat;
++	pix_format->width = 1280;
++	pix_format->height = 720;
++
++	ret = cedrus_proc_format_coded_prepare(ctx, format);
++	if (ret)
++		return ret;
++
++	format = &ctx->v4l2.format_picture;
++	format->type =
++		cedrus_proc_buffer_type(proc, CEDRUS_FORMAT_TYPE_PICTURE);
++	format->fmt.pix.pixelformat = V4L2_PIX_FMT_NV12_32L32;
++
++	return cedrus_proc_format_propagate(ctx, CEDRUS_FORMAT_TYPE_CODED);
++}
++
++static int cedrus_jpeg_format_propagate(struct cedrus_context *ctx,
++					unsigned int format_type)
++{
++	struct cedrus_jpeg_context *jpeg_ctx = ctx->proc_ctx;
++
++	if (format_type != CEDRUS_FORMAT_TYPE_CODED)
++		return 0;
++
++	/* A new coded format starts a new stream. */
++	jpeg_ctx->announced = false;
++
++	cedrus_jpeg_format_picture_prepare(ctx, &ctx->v4l2.format_picture);
++	cedrus_jpeg_format_picture_update(ctx);
++
++	return 0;
++}
++
++static bool cedrus_jpeg_format_dynamic_check(struct cedrus_context *ctx,
++					     struct v4l2_format *format)
++{
++	return false;
++}
++
++/* Size */
++
++static int cedrus_jpeg_size_picture_enum(struct cedrus_context *ctx,
++					 struct v4l2_frmsizeenum *frmsizeenum)
++{
++	/*
++	 * Decodable picture sizes, not buffer sizes: clients such as GStreamer
++	 * check the visible size (G_SELECTION, the JPEG's own size) against this
++	 * range, while G_FMT reports it aligned to the 32x32 tiles.
++	 */
++	frmsizeenum->stepwise = *ctx->engine->frmsize;
++
++	return 0;
++}
++
++/* Source change */
++
++/* Records the stream's picture format; true if it differs from the last. */
++static bool cedrus_jpeg_announce(struct cedrus_context *ctx,
++				 const struct cedrus_jpeg_hdr *hdr)
++{
++	static const struct v4l2_event event = {
++		.type = V4L2_EVENT_SOURCE_CHANGE,
++		.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION,
++	};
++	struct cedrus_jpeg_context *jpeg_ctx = ctx->proc_ctx;
++	u32 pixelformat = cedrus_jpeg_picture_fourcc(hdr->format);
++	unsigned long flags;
++	bool changed;
++
++	spin_lock_irqsave(&jpeg_ctx->lock, flags);
++	changed = !jpeg_ctx->announced || hdr->width != jpeg_ctx->width ||
++		  hdr->height != jpeg_ctx->height ||
++		  pixelformat != jpeg_ctx->pixelformat;
++	jpeg_ctx->announced = true;
++	jpeg_ctx->width = hdr->width;
++	jpeg_ctx->height = hdr->height;
++	jpeg_ctx->pixelformat = pixelformat;
++	spin_unlock_irqrestore(&jpeg_ctx->lock, flags);
++
++	if (changed)
++		v4l2_event_queue_fh(&ctx->v4l2.fh, &event);
++
++	return changed;
++}
++
++/*
++ * A coded buffer is queued (process context, queue lock held). Until the
++ * stream's format is known, frames are checked here: the first good one
++ * announces it, broken ones come back at once (there are no picture buffers
++ * to decode into yet). Later changes are found by the job itself
++ * (cedrus_jpeg_job_hold). Returns true if the buffer was completed here.
++ */
++static bool cedrus_jpeg_buffer_coded_queue(struct cedrus_context *ctx,
++					   struct cedrus_buffer *buffer)
++{
++	struct cedrus_jpeg_context *jpeg_ctx = ctx->proc_ctx;
++	struct vb2_v4l2_buffer *v4l2_buffer = &buffer->m2m_buffer.vb;
++	struct vb2_buffer *vb2_buffer = &v4l2_buffer->vb2_buf;
++	struct cedrus_jpeg_hdr *hdr = &jpeg_ctx->hdr;
++	void *vaddr = vb2_plane_vaddr(vb2_buffer, 0);
++	unsigned int payload = vb2_get_plane_payload(vb2_buffer, 0);
++	int ret;
++
++	if (jpeg_ctx->announced)
++		return false;
++
++	ret = cedrus_context_coded_cpu_begin(vb2_buffer);
++	if (!ret) {
++		ret = !vaddr || !payload ||
++		      cedrus_jpeg_hdr_parse(vaddr, payload,
++					    CEDRUS_JPEG_WIDTH_MAX,
++					    CEDRUS_JPEG_HEIGHT_MAX, hdr);
++		cedrus_context_coded_cpu_end(vb2_buffer);
++	}
++
++	if (ret) {
++		v4l2_buffer->sequence = jpeg_ctx->sequence++;
++		v4l2_m2m_buf_done(v4l2_buffer, VB2_BUF_STATE_ERROR);
++		return true;
++	}
++
++	cedrus_jpeg_announce(ctx, hdr);
++	cedrus_jpeg_format_picture_sync(ctx);
++
++	return false;
++}
++
++/*
++ * The job's frame (already validated) needs another picture format. The
++ * event goes out only if the stream really changed: after an OUTPUT restart
++ * the frame announced itself when it was queued.
++ */
++static void cedrus_jpeg_job_hold(struct cedrus_context *ctx,
++				 struct vb2_v4l2_buffer *dst)
++{
++	struct cedrus_jpeg_context *jpeg_ctx = ctx->proc_ctx;
++	struct cedrus_dec_jpeg_job *job = ctx->engine_job;
++
++	cedrus_jpeg_announce(ctx, &job->hdr);
++
++	/* The empty buffer carries the number of the frame that waits. */
++	dst->sequence = jpeg_ctx->sequence;
++}
++
++static void cedrus_jpeg_queue_streaming(struct cedrus_context *ctx,
++					struct vb2_queue *queue, bool start)
++{
++	struct cedrus_jpeg_context *jpeg_ctx = ctx->proc_ctx;
++	unsigned long flags;
++
++	/* A restarted (e.g. seeking) stream announces its format again. */
++	if (!start && V4L2_TYPE_IS_OUTPUT(queue->type)) {
++		spin_lock_irqsave(&jpeg_ctx->lock, flags);
++		jpeg_ctx->announced = false;
++		spin_unlock_irqrestore(&jpeg_ctx->lock, flags);
++		jpeg_ctx->sequence = 0;
++	}
++}
++
++/* Context */
++
++static int cedrus_jpeg_context_setup(struct cedrus_context *ctx)
++{
++	struct cedrus_jpeg_context *jpeg_ctx;
++
++	jpeg_ctx = kzalloc(sizeof(*jpeg_ctx), GFP_KERNEL);
++	if (!jpeg_ctx)
++		return -ENOMEM;
++
++	spin_lock_init(&jpeg_ctx->lock);
++	ctx->proc_ctx = jpeg_ctx;
++
++	return 0;
++}
++
++static void cedrus_jpeg_context_cleanup(struct cedrus_context *ctx)
++{
++	kfree(ctx->proc_ctx);
++	ctx->proc_ctx = NULL;
++}
++
++/* Engines */
++
++static const struct cedrus_engine *cedrus_jpeg_engines[] = {
++	&cedrus_dec_jpeg,
++	&cedrus_dec_mjpeg,
++};
++
++/* Decoder */
++
++static const struct cedrus_proc_config cedrus_jpeg_config = {
++	.role			= CEDRUS_ROLE_DECODER,
++	.name			= "jpeg",
++	.stateful		= true,
++	.coded_cpu_access	= true,
++
++	.engines		= cedrus_jpeg_engines,
++	.engines_count		= ARRAY_SIZE(cedrus_jpeg_engines),
++
++	.formats		= cedrus_jpeg_formats,
++	.formats_count		= ARRAY_SIZE(cedrus_jpeg_formats),
++};
++
++static const struct cedrus_proc_ops cedrus_jpeg_ops = {
++	.context_setup			= cedrus_jpeg_context_setup,
++	.context_cleanup		= cedrus_jpeg_context_cleanup,
++
++	.format_picture_prepare		= cedrus_jpeg_format_picture_prepare,
++	.format_picture_configure	= cedrus_jpeg_format_picture_configure,
++	.format_picture_get		= cedrus_jpeg_format_picture_get,
++	.selection_picture_get		= cedrus_jpeg_selection_picture_get,
++	.format_picture_sync		= cedrus_jpeg_format_picture_sync,
++
++	.format_setup			= cedrus_jpeg_format_setup,
++	.format_propagate		= cedrus_jpeg_format_propagate,
++	.format_dynamic_check		= cedrus_jpeg_format_dynamic_check,
++
++	.size_picture_enum		= cedrus_jpeg_size_picture_enum,
++
++	.buffer_coded_queue		= cedrus_jpeg_buffer_coded_queue,
++	.queue_streaming		= cedrus_jpeg_queue_streaming,
++
++	.job_hold			= cedrus_jpeg_job_hold,
++	.format_picture_adopt		= cedrus_jpeg_format_picture_adopt,
++};
++
++int cedrus_jpeg_setup(struct cedrus_device *dev)
++{
++	return cedrus_proc_setup(dev, &dev->jpeg, &cedrus_jpeg_ops,
++				 &cedrus_jpeg_config);
++}
++
++void cedrus_jpeg_cleanup(struct cedrus_device *dev)
++{
++	cedrus_proc_cleanup(&dev->jpeg);
++}
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.h b/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.h
+new file mode 100644
+index 000000000..898b0fb8c
+--- /dev/null
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.h
+@@ -0,0 +1,50 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Cedrus Video Engine Driver
++ *
++ * Stateful JPEG decoder node (cedrus-jpeg).
++ */
++
++#ifndef _CEDRUS_JPEG_H_
++#define _CEDRUS_JPEG_H_
++
++#include <linux/spinlock.h>
++#include <linux/videodev2.h>
++
++#include "cedrus_jpeg_hdr.h"
++
++struct cedrus_context;
++struct cedrus_device;
++
++/* Tested up to 4096x4096; the VE's MCU counters are 16 bits wide. */
++#define CEDRUS_JPEG_WIDTH_MAX	4096U
++#define CEDRUS_JPEG_HEIGHT_MAX	4096U
++
++/* Per-context state of the node (cedrus_context.proc_ctx). */
++struct cedrus_jpeg_context {
++	/* Scratch for the header check when a frame is queued. */
++	struct cedrus_jpeg_hdr	hdr;
++
++	/*
++	 * Picture size and fourcc last signalled with SOURCE_CHANGE; written
++	 * from the job too (resolution change), hence the lock.
++	 */
++	spinlock_t		lock;
++	bool			announced;
++	unsigned int		width;
++	unsigned int		height;
++	u32			pixelformat;
++
++	/* Frame counter, reported as v4l2_buffer.sequence on both queues. */
++	u32			sequence;
++};
++
++u32 cedrus_jpeg_picture_fourcc(unsigned int format);
++int cedrus_jpeg_format_coded_prepare(struct cedrus_context *ctx,
++				     struct v4l2_format *format);
++void cedrus_jpeg_format_picture_update(struct cedrus_context *ctx);
++
++int cedrus_jpeg_setup(struct cedrus_device *dev);
++void cedrus_jpeg_cleanup(struct cedrus_device *dev);
++
++#endif
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_jpeg_hdr.c b/drivers/staging/media/sunxi/cedrus/cedrus_jpeg_hdr.c
+new file mode 100644
+index 000000000..a37569998
+--- /dev/null
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_jpeg_hdr.c
+@@ -0,0 +1,253 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Cedrus Video Engine Driver
++ *
++ * JPEG header checks for the A10/A20 JPEG decoder: everything the VE is
++ * given is validated and copied here, before the first register write.
++ * Register sequence and table layout after Allwinner's libvecore,
++ * mjpeg_hal.c and Jens Kuske's jpeg-test.
++ */
++
++#include <linux/errno.h>
++#include <linux/math.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <media/v4l2-jpeg.h>
++
++#include "cedrus_jpeg_hdr.h"
++
++#define CEDRUS_JPEG_SIZE_MIN	16
++/* Zero bytes tolerated after EOI (the buffer is read uncached). */
++#define CEDRUS_JPEG_PADDING_MAX	4096
++/* Symbols of an 8-bit baseline table: DC categories 0-11, 162 AC codes. */
++#define CEDRUS_JPEG_DC_SYMBOLS_MAX	16
++#define CEDRUS_JPEG_AC_SYMBOLS_MAX	162
++
++/* Sampling factors Yh Yv Cbh Cbv Crh Crv, one nibble each. */
++static int cedrus_jpeg_hdr_format(const struct v4l2_jpeg_frame_header *frame)
++{
++	const struct v4l2_jpeg_frame_component_spec *c = frame->component;
++	u32 key = 0;
++	unsigned int i;
++
++	for (i = 0; i < 3; i++)
++		key |= (c[i].horizontal_sampling_factor << 4 |
++			c[i].vertical_sampling_factor) << (16 - 8 * i);
++
++	/*
++	 * The VE also decodes 4:1:1 (into a layout of its own) and 4:4:0, but
++	 * gray frames leave the picture buffer untouched (J2 probe).
++	 */
++	switch (key) {
++	case 0x221111:
++		return CEDRUS_JPEG_FMT_420;
++	case 0x211111:
++		return CEDRUS_JPEG_FMT_422;
++	case 0x111111:
++		return CEDRUS_JPEG_FMT_444;
++	default:
++		return -EBADMSG;
++	}
++}
++
++static const u8 *cedrus_jpeg_hdr_ref_ht(unsigned int tc, unsigned int th)
++{
++	if (tc)
++		return th ? v4l2_jpeg_ref_table_chroma_ac_ht :
++			    v4l2_jpeg_ref_table_luma_ac_ht;
++
++	return th ? v4l2_jpeg_ref_table_chroma_dc_ht :
++		    v4l2_jpeg_ref_table_luma_dc_ht;
++}
++
++/* Copies Huffman table (tc, th) into a slot; the length must match BITS. */
++static int cedrus_jpeg_hdr_ht(const struct v4l2_jpeg_reference *tables,
++			      unsigned int tc, unsigned int th,
++			      struct cedrus_jpeg_hdr *hdr, unsigned int slot)
++{
++	const struct v4l2_jpeg_reference *ref = &tables[tc << 1 | th];
++	const u8 *bits = ref->start;
++	unsigned int count = 0, code = 0, i;
++
++	/* No DHT: UVC MJPEG relies on the standard tables. */
++	if (!bits)
++		bits = cedrus_jpeg_hdr_ref_ht(tc, th);
++
++	memcpy(hdr->bits[slot], bits, 16);
++	for (i = 0; i < 16; i++) {
++		count += hdr->bits[slot][i];
++		/*
++		 * Kraft: the codes of lengths 1..i+1 must fit in i+1 bits
++		 * (the all-ones code is reserved).
++		 */
++		code = (code << 1) + hdr->bits[slot][i];
++		if (code >= 1U << (i + 1))
++			return -EBADMSG;
++	}
++
++	if (count > (tc ? CEDRUS_JPEG_AC_SYMBOLS_MAX :
++			  CEDRUS_JPEG_DC_SYMBOLS_MAX) ||
++	    (ref->start && ref->length != 16 + count))
++		return -EBADMSG;
++
++	memcpy(hdr->vals[slot], bits + 16, count);
++	hdr->counts[slot] = count;
++
++	return 0;
++}
++
++int cedrus_jpeg_hdr_parse(const void *buf, size_t len,
++			  unsigned int max_width, unsigned int max_height,
++			  struct cedrus_jpeg_hdr *hdr)
++{
++	struct v4l2_jpeg_reference qtables[4] = { 0 };
++	struct v4l2_jpeg_reference htables[4] = { 0 };
++	struct v4l2_jpeg_scan_header scan = { 0 };
++	struct v4l2_jpeg_header h = {
++		.scan			= &scan,
++		.quantization_tables	= qtables,
++		.huffman_tables		= htables,
++	};
++	const struct v4l2_jpeg_frame_component_spec *fc = h.frame.component;
++	const struct v4l2_jpeg_scan_component_spec *sc = scan.component;
++	const u8 *d = buf;
++	size_t end;
++	unsigned int i, j;
++	int ret;
++
++	memset(hdr, 0, sizeof(*hdr));
++
++	/* The parser casts the const away but only reads. */
++	if (v4l2_jpeg_parse_header((void *)buf, len, &h))
++		return -EBADMSG;
++
++	/* SOF0/SOF1 only (the parser rejects the others), 8 bits. */
++	if (!h.sof.start || h.frame.precision != 8)
++		return -EBADMSG;
++
++	/* The VE resynchronises at RSTn markers itself. */
++	hdr->restart_interval = h.restart_interval;
++
++	/* Y, Cb, Cr in one interleaved scan, in frame order (T.81 B.2.3). */
++	if (h.frame.num_components != 3 || scan.num_components != 3 ||
++	    !h.sos.start)
++		return -EBADMSG;
++
++	for (i = 0; i < 3; i++) {
++		if (sc[i].component_selector != fc[i].component_identifier)
++			return -EBADMSG;
++		for (j = 0; j < i; j++)
++			if (fc[j].component_identifier ==
++			    fc[i].component_identifier)
++				return -EBADMSG;
++		if (fc[i].quantization_table_selector > 3 ||
++		    sc[i].dc_entropy_coding_table_selector > 1 ||
++		    sc[i].ac_entropy_coding_table_selector > 1)
++			return -EBADMSG;
++	}
++
++	/* One chroma Q table and Huffman set in the VE. */
++	if (fc[1].quantization_table_selector !=
++	    fc[2].quantization_table_selector ||
++	    sc[1].dc_entropy_coding_table_selector !=
++	    sc[2].dc_entropy_coding_table_selector ||
++	    sc[1].ac_entropy_coding_table_selector !=
++	    sc[2].ac_entropy_coding_table_selector)
++		return -EBADMSG;
++
++	ret = cedrus_jpeg_hdr_format(&h.frame);
++	if (ret < 0)
++		return ret;
++	hdr->format = ret;
++
++	if (h.frame.width < CEDRUS_JPEG_SIZE_MIN ||
++	    h.frame.height < CEDRUS_JPEG_SIZE_MIN ||
++	    h.frame.width > max_width || h.frame.height > max_height)
++		return -EBADMSG;
++	hdr->width = h.frame.width;
++	hdr->height = h.frame.height;
++
++	/* MCU: 8 x the luma factors (Cb and Cr are 1x1); Y blocks + 2. */
++	hdr->mcu_width = DIV_ROUND_UP(hdr->width,
++				      8 * fc[0].horizontal_sampling_factor);
++	hdr->mcu_height = DIV_ROUND_UP(hdr->height,
++				       8 * fc[0].vertical_sampling_factor);
++	hdr->mcu_blocks = fc[0].horizontal_sampling_factor *
++			  fc[0].vertical_sampling_factor + 2;
++
++	if (h.ecs_offset >= len)
++		return -EBADMSG;
++	hdr->ecs_offset = h.ecs_offset;
++
++	/*
++	 * The scan must end with EOI (a little zero padding after it is fine):
++	 * when the data runs out without one, the VE waits for more and never
++	 * finishes.
++	 */
++	for (end = len; end > h.ecs_offset + 2 && !d[end - 1] &&
++	     len - end < CEDRUS_JPEG_PADDING_MAX; end--)
++		;
++	if (end < h.ecs_offset + 2 || d[end - 2] != 0xff || d[end - 1] != 0xd9)
++		return -EBADMSG;
++
++	/* 8-bit tables: luma from component 0, chroma from component 1. */
++	for (i = 0; i < 2; i++) {
++		const struct v4l2_jpeg_reference *qt =
++			&qtables[fc[i].quantization_table_selector];
++
++		if (!qt->start || qt->length != 64)
++			return -EBADMSG;
++		memcpy(hdr->qt[i], qt->start, 64);
++	}
++
++	for (i = 0; i < 2; i++) {
++		ret = cedrus_jpeg_hdr_ht(htables, 0,
++					 sc[i].dc_entropy_coding_table_selector,
++					 hdr, 2 * i);
++		if (!ret)
++			ret = cedrus_jpeg_hdr_ht(htables, 1,
++						 sc[i].ac_entropy_coding_table_selector,
++						 hdr, 2 * i + 1);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/*
++ * Huffman SRAM image, slot s: u16 [32s + 0..15] first canonical code of each
++ * length (0xffff after the last used length), bytes [64s + 32..47] number of
++ * symbols with shorter codes, bytes [1024 + 256s ...] HUFFVAL.
++ */
++void cedrus_jpeg_hdr_sram(const struct cedrus_jpeg_hdr *hdr,
++			  u8 img[CEDRUS_JPEG_SRAM_WORDS * 4])
++{
++	unsigned int slot, len;
++
++	memset(img, 0, CEDRUS_JPEG_SRAM_WORDS * 4);
++
++	for (slot = 0; slot < CEDRUS_JPEG_HT_SLOTS; slot++) {
++		const u8 *bits = hdr->bits[slot];
++		unsigned int code = 0, count = 0, last = 0;
++
++		for (len = 0; len < 16; len++) {
++			img[2 * (32 * slot + len)] = code & 0xff;
++			img[2 * (32 * slot + len) + 1] = (code >> 8) & 0xff;
++			img[64 * slot + 32 + len] = count;
++
++			code = (code + bits[len]) << 1;
++			count += bits[len];
++			if (bits[len])
++				last = len;
++		}
++
++		for (len = last + 1; len < 16; len++) {
++			img[2 * (32 * slot + len)] = 0xff;
++			img[2 * (32 * slot + len) + 1] = 0xff;
++		}
++
++		memcpy(img + 1024 + 256 * slot, hdr->vals[slot],
++		       hdr->counts[slot]);
++	}
++}
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_jpeg_hdr.h b/drivers/staging/media/sunxi/cedrus/cedrus_jpeg_hdr.h
+new file mode 100644
+index 000000000..6196a4fe6
+--- /dev/null
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_jpeg_hdr.h
+@@ -0,0 +1,51 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Cedrus Video Engine Driver
++ *
++ * JPEG header checks for the A10/A20 JPEG decoder. Pure C on top of
++ * v4l2-jpeg, so it can also be built and fuzzed on a host.
++ */
++
++#ifndef _CEDRUS_JPEG_HDR_H_
++#define _CEDRUS_JPEG_HDR_H_
++
++#include <linux/types.h>
++
++/* Chroma format codes of VE_DEC_MPEG_TRIGGER bits 29:27 for JPEG. */
++#define CEDRUS_JPEG_FMT_420		0
++#define CEDRUS_JPEG_FMT_422		2
++#define CEDRUS_JPEG_FMT_444		3
++
++/* Huffman slots of the VE: luma DC/AC, chroma DC/AC. */
++#define CEDRUS_JPEG_HT_SLOTS		4
++
++/* Huffman SRAM image size (VE_DEC_MPEG_SRAM_RW_DATA words). */
++#define CEDRUS_JPEG_SRAM_WORDS		512
++
++/*
++ * A frame the VE can decode, with copies of every table it uses, so nothing
++ * refers back to a buffer userspace may rewrite.
++ */
++struct cedrus_jpeg_hdr {
++	unsigned int	width;
++	unsigned int	height;
++	unsigned int	format;		/* CEDRUS_JPEG_FMT_* */
++	unsigned int	mcu_width;	/* MCUs per row and column */
++	unsigned int	mcu_height;
++	unsigned int	mcu_blocks;	/* 8x8 blocks per MCU */
++	unsigned int	ecs_offset;	/* entropy-coded data, bytes */
++	unsigned int	restart_interval;	/* MCUs, 0 = none */
++
++	u8		qt[2][64];	/* luma, chroma; DQT (zig-zag) order */
++	u8		bits[CEDRUS_JPEG_HT_SLOTS][16];
++	u8		vals[CEDRUS_JPEG_HT_SLOTS][256];
++	unsigned int	counts[CEDRUS_JPEG_HT_SLOTS];
++};
++
++int cedrus_jpeg_hdr_parse(const void *buf, size_t len,
++			  unsigned int max_width, unsigned int max_height,
++			  struct cedrus_jpeg_hdr *hdr);
++void cedrus_jpeg_hdr_sram(const struct cedrus_jpeg_hdr *hdr,
++			  u8 img[CEDRUS_JPEG_SRAM_WORDS * 4]);
++
++#endif
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_proc.c b/drivers/staging/media/sunxi/cedrus/cedrus_proc.c
+index 2e9752100..9bd20aabf 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_proc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_proc.c
+@@ -335,6 +335,16 @@ static int cedrus_proc_enum_fmt(struct file *file, void *private,
+ 			if (format_type == CEDRUS_FORMAT_TYPE_CODED)
+ 				fmtdesc->flags |= V4L2_FMT_FLAG_COMPRESSED;
+ 
++			/* Stateful decoders signal size changes (SOURCE_CHANGE). */
++			if (proc->stateful && proc->role == CEDRUS_ROLE_DECODER &&
++			    format_type == CEDRUS_FORMAT_TYPE_CODED)
++				fmtdesc->flags |= V4L2_FMT_FLAG_DYN_RESOLUTION;
++
++			if (format->description)
++				strscpy(fmtdesc->description,
++					format->description,
++					sizeof(fmtdesc->description));
++
+ 			if (proc->role == CEDRUS_ROLE_ENCODER &&
+ 			    format_type == CEDRUS_FORMAT_TYPE_CODED)
+ 				fmtdesc->flags |=
+@@ -360,12 +370,24 @@ static int cedrus_proc_g_fmt(struct file *file, void *private,
+ 
+ 	if (format_type == CEDRUS_FORMAT_TYPE_CODED)
+ 		*format = ctx->v4l2.format_coded;
++	else if (ctx->proc->ops->format_picture_get)
++		ctx->proc->ops->format_picture_get(ctx, format);
+ 	else
+ 		*format = ctx->v4l2.format_picture;
+ 
+ 	return 0;
+ }
+ 
++/* Lets a stateful decoder's picture format follow the stream. */
++static void cedrus_proc_format_picture_sync(struct cedrus_context *ctx,
++					    u32 type)
++{
++	if (ctx->proc->ops->format_picture_sync &&
++	    cedrus_proc_format_type(ctx->proc, type) ==
++	    CEDRUS_FORMAT_TYPE_PICTURE)
++		ctx->proc->ops->format_picture_sync(ctx);
++}
++
+ static bool cedrus_proc_encoder_busy(struct cedrus_context *ctx)
+ {
+ 	return cedrus_context_queue_busy_check(ctx, V4L2_BUF_TYPE_VIDEO_OUTPUT) ||
+@@ -393,8 +415,11 @@ static bool cedrus_proc_cache_hint(struct cedrus_context *ctx, u32 type,
+ static int cedrus_proc_reqbufs(struct file *file, void *private,
+ 			       struct v4l2_requestbuffers *rb)
+ {
+-	if (cedrus_proc_cache_hint(cedrus_file2context(file), rb->type,
+-				   rb->memory))
++	struct cedrus_context *ctx = cedrus_file2context(file);
++
++	cedrus_proc_format_picture_sync(ctx, rb->type);
++
++	if (cedrus_proc_cache_hint(ctx, rb->type, rb->memory))
+ 		rb->flags |= V4L2_MEMORY_FLAG_NON_COHERENT;
+ 
+ 	return v4l2_m2m_ioctl_reqbufs(file, private, rb);
+@@ -403,8 +428,11 @@ static int cedrus_proc_reqbufs(struct file *file, void *private,
+ static int cedrus_proc_create_bufs(struct file *file, void *private,
+ 				   struct v4l2_create_buffers *create)
+ {
+-	if (cedrus_proc_cache_hint(cedrus_file2context(file),
+-				   create->format.type, create->memory))
++	struct cedrus_context *ctx = cedrus_file2context(file);
++
++	cedrus_proc_format_picture_sync(ctx, create->format.type);
++
++	if (cedrus_proc_cache_hint(ctx, create->format.type, create->memory))
+ 		create->flags |= V4L2_MEMORY_FLAG_NON_COHERENT;
+ 
+ 	return v4l2_m2m_ioctl_create_bufs(file, private, create);
+@@ -430,6 +458,15 @@ static int cedrus_proc_s_fmt(struct file *file, void *private,
+ 	    cedrus_proc_encoder_busy(ctx))
+ 		return -EBUSY;
+ 
++	/*
++	 * A stateful decoder derives the picture format from the coded one:
++	 * no coded format change while picture buffers exist.
++	 */
++	if (ctx->proc->stateful && ctx->proc->role == CEDRUS_ROLE_DECODER &&
++	    format_type == CEDRUS_FORMAT_TYPE_CODED &&
++	    cedrus_context_queue_busy_check(ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE))
++		return -EBUSY;
++
+ 	if (!dynamic && busy)
+ 		return -EINVAL;
+ 
+@@ -558,6 +595,37 @@ static int cedrus_proc_g_selection(struct file *file, void *private,
+ 	if (format_type != CEDRUS_FORMAT_TYPE_PICTURE)
+ 		return -EINVAL;
+ 
++	/* Stateful decoder: the visible part of the decoded picture. */
++	if (ctx->proc->stateful && ctx->proc->role == CEDRUS_ROLE_DECODER) {
++		struct v4l2_format format = { .type = selection->type };
++
++		if (selection->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
++			return -EINVAL;
++
++		cedrus_proc_g_fmt(file, private, &format);
++
++		switch (selection->target) {
++		case V4L2_SEL_TGT_COMPOSE:
++		case V4L2_SEL_TGT_COMPOSE_DEFAULT:
++			if (ctx->proc->ops->selection_picture_get)
++				ctx->proc->ops->selection_picture_get(ctx,
++								      &selection->r);
++			else
++				selection->r = ctx->v4l2.selection_picture;
++			return 0;
++		/* The decoder may write the whole aligned picture. */
++		case V4L2_SEL_TGT_COMPOSE_BOUNDS:
++		case V4L2_SEL_TGT_COMPOSE_PADDED:
++			selection->r.top = 0;
++			selection->r.left = 0;
++			selection->r.width = format.fmt.pix.width;
++			selection->r.height = format.fmt.pix.height;
++			return 0;
++		}
++
++		return -EINVAL;
++	}
++
+ 	switch (selection->target) {
+ 	case V4L2_SEL_TGT_CROP_DEFAULT:
+ 	case V4L2_SEL_TGT_CROP_BOUNDS:
+@@ -719,7 +787,8 @@ static int cedrus_proc_decoder_cmd(struct file *file, void *private,
+ {
+ 	struct cedrus_context *ctx = cedrus_file2context(file);
+ 	struct v4l2_m2m_ctx *m2m_ctx = ctx->v4l2.fh.m2m_ctx;
+-	bool stopped;
++	unsigned long flags;
++	bool stopped, eos;
+ 	int ret;
+ 
+ 	if (!ctx->proc->stateful)
+@@ -728,8 +797,6 @@ static int cedrus_proc_decoder_cmd(struct file *file, void *private,
+ 
+ 	/* Stateful: drain like the encoder (cedrus_proc_encoder_cmd). */
+ 
+-	stopped = v4l2_m2m_has_stopped(m2m_ctx);
+-
+ 	ret = v4l2_m2m_ioctl_try_decoder_cmd(file, private, decoder_cmd);
+ 	if (ret)
+ 		return ret;
+@@ -737,16 +804,43 @@ static int cedrus_proc_decoder_cmd(struct file *file, void *private,
+ 	if (!vb2_is_streaming(v4l2_m2m_get_src_vq(m2m_ctx)))
+ 		return 0;
+ 
+-	ret = v4l2_m2m_ioctl_decoder_cmd(file, private, decoder_cmd);
+-	if (ret)
++	spin_lock_irqsave(&ctx->state_lock, flags);
++
++	/* During a resolution change (cedrus_context_job_hold). */
++	if (ctx->hold && decoder_cmd->cmd == V4L2_DEC_CMD_START) {
++		/* No job runs while held: the hold cannot end under us. */
++		spin_unlock_irqrestore(&ctx->state_lock, flags);
++		return cedrus_context_hold_resume(ctx, true);
++	}
++
++	if (ctx->hold) {
++		/* STOP: drain once resumed, up to the last frame queued now. */
++		ret = ctx->hold_drain ? -EBUSY : 0;
++		if (!ret) {
++			m2m_ctx->last_src_buf = v4l2_m2m_last_src_buf(m2m_ctx);
++			ctx->hold_drain = true;
++		}
++		spin_unlock_irqrestore(&ctx->state_lock, flags);
+ 		return ret;
++	}
+ 
+-	if (decoder_cmd->cmd == V4L2_DEC_CMD_STOP &&
+-	    v4l2_m2m_has_stopped(m2m_ctx))
++	stopped = v4l2_m2m_has_stopped(m2m_ctx);
++	ret = v4l2_m2m_ioctl_decoder_cmd(file, private, decoder_cmd);
++	eos = !ret && decoder_cmd->cmd == V4L2_DEC_CMD_STOP &&
++	      v4l2_m2m_has_stopped(m2m_ctx);
++	if (eos)
+ 		cedrus_context_eos(ctx);
+ 
+-	if (decoder_cmd->cmd == V4L2_DEC_CMD_START && stopped)
++	spin_unlock_irqrestore(&ctx->state_lock, flags);
++
++	if (ret)
++		return ret;
++
++	if (decoder_cmd->cmd == V4L2_DEC_CMD_START && stopped) {
+ 		vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(m2m_ctx));
++		/* m2m's START does not schedule the frames already queued. */
++		v4l2_m2m_try_schedule(m2m_ctx);
++	}
+ 
+ 	return 0;
+ }
+@@ -1097,6 +1191,7 @@ int cedrus_proc_setup(struct cedrus_device *dev, struct cedrus_proc *proc,
+ 	proc->role = config->role;
+ 	proc->stateful = config->stateful;
+ 	proc->supports_requests = config->supports_requests;
++	proc->coded_cpu_access = config->coded_cpu_access;
+ 
+ 	spin_lock_init(&proc->ctx_active_lock);
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_proc.h b/drivers/staging/media/sunxi/cedrus/cedrus_proc.h
+index 00986bbca..112fde2ba 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_proc.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_proc.h
+@@ -19,6 +19,8 @@ struct cedrus_format;
+ struct cedrus_device;
+ struct cedrus_proc;
+ struct cedrus_context;
++struct cedrus_buffer;
++struct vb2_queue;
+ 
+ enum cedrus_role {
+ 	CEDRUS_ROLE_DECODER,
+@@ -38,6 +40,8 @@ struct cedrus_proc_config {
+ 	/* Stateful (drain, LAST/EOS) rather than stateless (requests) API. */
+ 	bool				stateful;
+ 	bool				supports_requests;
++	/* The kernel reads the bitstream (header parsing): MMAP only. */
++	bool				coded_cpu_access;
+ 
+ 	const struct cedrus_engine	**engines;
+ 	unsigned int			engines_count;
+@@ -47,9 +51,23 @@ struct cedrus_proc_config {
+ };
+ 
+ struct cedrus_proc_ops {
++	/* Optional: per-context state of the node (ctx->proc_ctx). */
++	int (*context_setup)(struct cedrus_context *ctx);
++	void (*context_cleanup)(struct cedrus_context *ctx);
++
+ 	int (*format_picture_prepare)(struct cedrus_context *ctx,
+ 				      struct v4l2_format *format);
+ 	int (*format_picture_configure)(struct cedrus_context *ctx);
++	/*
++	 * Optional, stateful decoders: G_FMT of the picture queue (the format
++	 * read from the stream), and the point where the picture format may
++	 * follow it (no picture buffers allocated).
++	 */
++	void (*format_picture_get)(struct cedrus_context *ctx,
++				   struct v4l2_format *format);
++	void (*selection_picture_get)(struct cedrus_context *ctx,
++				      struct v4l2_rect *visible);
++	void (*format_picture_sync)(struct cedrus_context *ctx);
+ 
+ 	int (*format_setup)(struct cedrus_context *ctx);
+ 	int (*format_propagate)(struct cedrus_context *ctx,
+@@ -59,6 +77,27 @@ struct cedrus_proc_ops {
+ 
+ 	int (*size_picture_enum)(struct cedrus_context *ctx,
+ 				 struct v4l2_frmsizeenum *frmsizeenum);
++
++	/*
++	 * Optional: a coded buffer is queued. Returns true if the node
++	 * completed it and it must not reach the job queue.
++	 */
++	bool (*buffer_coded_queue)(struct cedrus_context *ctx,
++				   struct cedrus_buffer *buffer);
++	/* Optional, stateful nodes: a queue starts or stops streaming. */
++	void (*queue_streaming)(struct cedrus_context *ctx,
++				struct vb2_queue *queue, bool start);
++
++	/*
++	 * Optional, stateful decoders with dynamic resolution change, when
++	 * job_configure returned -EAGAIN: announce the frame's format (dst is
++	 * the picture buffer that goes back empty with LAST). With it:
++	 * format_picture_adopt, the picture format follows the announced one
++	 * even with buffers allocated (the client resumed).
++	 */
++	void (*job_hold)(struct cedrus_context *ctx,
++			 struct vb2_v4l2_buffer *dst);
++	void (*format_picture_adopt)(struct cedrus_context *ctx);
+ };
+ 
+ struct cedrus_proc_v4l2 {
+@@ -81,6 +120,7 @@ struct cedrus_proc {
+ 	int				role;
+ 	bool				stateful;
+ 	bool				supports_requests;
++	bool				coded_cpu_access;
+ 
+ 	struct cedrus_proc_v4l2		v4l2;
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+index 651f5fb8d..0c5c7496c 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+@@ -178,6 +178,8 @@
+ #define VE_DEC_MPEG_CTRL_IRQ_MASK \
+ 	(VE_DEC_MPEG_CTRL_FINISH_IRQ_EN | VE_DEC_MPEG_CTRL_ERROR_IRQ_EN | \
+ 	 VE_DEC_MPEG_CTRL_VLD_DATA_REQ_IRQ_EN)
++/* JPEG: bits 6:2, as the Allwinner library writes (bit 2 undocumented). */
++#define VE_DEC_MPEG_CTRL_JPEG_IRQ_MASK		GENMASK(6, 2)
+ 
+ #define VE_DEC_MPEG_TRIGGER			(VE_ENGINE_DEC_MPEG + 0x18)
+ 
+@@ -188,6 +190,7 @@
+ #define VE_DEC_MPEG_TRIGGER_CHROMA_FMT_422	(0x02 << 27)
+ #define VE_DEC_MPEG_TRIGGER_CHROMA_FMT_444	(0x03 << 27)
+ #define VE_DEC_MPEG_TRIGGER_CHROMA_FMT_422T	(0x04 << 27)
++#define VE_DEC_MPEG_TRIGGER_CHROMA_FMT_400	(0x05 << 27)
+ 
+ #define VE_DEC_MPEG_TRIGGER_MPEG1		(0x01 << 24)
+ #define VE_DEC_MPEG_TRIGGER_MPEG2		(0x02 << 24)
+@@ -246,6 +249,11 @@
+ 	 VE_DEC_MPEG_STATUS_VLD_DATA_REQ)
+ #define VE_DEC_MPEG_STATUS_CHECK_ERROR \
+ 	(VE_DEC_MPEG_STATUS_ERROR | VE_DEC_MPEG_STATUS_VLD_DATA_REQ)
++#define VE_DEC_MPEG_STATUS_JPEG_ERRORS \
++	(VE_DEC_MPEG_STATUS_JPEG_BIT_END | VE_DEC_MPEG_STATUS_JPEG_RESTART_ERROR | \
++	 VE_DEC_MPEG_STATUS_JPEG_MARKER)
++/* Cleared before a JPEG job, as Jens Kuske's jpeg-test does. */
++#define VE_DEC_MPEG_STATUS_JPEG_CLEAR		0x0000c00f
+ 
+ #define VE_DEC_MPEG_VLD_ADDR			(VE_ENGINE_DEC_MPEG + 0x28)
+ 
+@@ -281,7 +289,16 @@
+ #define VE_DEC_MPEG_ERROR			(VE_ENGINE_DEC_MPEG + 0xc4)
+ #define VE_DEC_MPEG_CRTMBADDR			(VE_ENGINE_DEC_MPEG + 0xc8)
+ #define VE_DEC_MPEG_ROT_LUMA			(VE_ENGINE_DEC_MPEG + 0xcc)
++#define VE_DEC_MPEG_JPEG_SIZE			(VE_ENGINE_DEC_MPEG + 0xb8)
++
++#define VE_DEC_MPEG_JPEG_SIZE_WIDTH(w)		SHIFT_AND_MASK_BITS(w, 15, 0)
++#define VE_DEC_MPEG_JPEG_SIZE_HEIGHT(h)		SHIFT_AND_MASK_BITS(h, 31, 16)
++
++#define VE_DEC_MPEG_JPEG_RES_INT		(VE_ENGINE_DEC_MPEG + 0xc0)
+ #define VE_DEC_MPEG_ROT_CHROMA			(VE_ENGINE_DEC_MPEG + 0xd0)
++#define VE_DEC_MPEG_SDROT_CTRL			(VE_ENGINE_DEC_MPEG + 0xd4)
++#define VE_DEC_MPEG_SRAM_RW_OFFSET		(VE_ENGINE_DEC_MPEG + 0xe0)
++#define VE_DEC_MPEG_SRAM_RW_DATA		(VE_ENGINE_DEC_MPEG + 0xe4)
+ 
+ /* H.265 Decoder Registers */
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/uapi/cedrus-dec.h b/drivers/staging/media/sunxi/cedrus/uapi/cedrus-dec.h
+new file mode 100644
+index 000000000..bdfb73421
+--- /dev/null
++++ b/drivers/staging/media/sunxi/cedrus/uapi/cedrus-dec.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * Cedrus Video Engine Driver: decoder uAPI.
++ *
++ * Driver-private pixel formats of the decoded pictures.
++ */
++
++#ifndef _UAPI_CEDRUS_DEC_H_
++#define _UAPI_CEDRUS_DEC_H_
++
++#include <linux/videodev2.h>
++
++/*
++ * Y/CbCr 4:2:2 in 32x32 tiles: the luma plane as in V4L2_PIX_FMT_NV12_32L32,
++ * followed by an interleaved CbCr plane of the same height and tiling (one
++ * chroma row per luma row). Width and height are multiples of 32; the plane
++ * stride is bytesperline. Output of the A10/A20 JPEG decoder for 4:2:2 JPEGs.
++ */
++#define V4L2_PIX_FMT_CEDRUS_NV16_32L32	v4l2_fourcc('S', 'T', '1', '6')
++
++#endif
+-- 
+2.55.0
+

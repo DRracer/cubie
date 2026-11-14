@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Tue, 20 Oct 2026 06:32:07 +0200
+Subject: [PATCH] clk: sunxi-ng: a10: export pll-ddr-other and pin the MP
+ clock parent
+
+The A20 mixer processor (2D engine) has to run from pll-ddr-other, like
+the legacy 3.4 driver did. Its module clock "de-mp" can also be muxed
+to the two video PLLs, but their rates follow the display modes, which
+would change the engine clock with every mode set.
+
+Export pll-ddr-other so that the device tree can select it through
+assigned-clock-parents, and set CLK_SET_RATE_NO_REPARENT on de-mp: the
+sunxi-ng mux helper otherwise considers every parent on a rate request,
+and a video PLL that happens to give the same or a closer rate would
+silently take over. de-mp has no other user, and it still never changes
+the rate of its parent.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/clk/sunxi-ng/ccu-sun4i-a10.c      | 9 +++++++--
+ drivers/clk/sunxi-ng/ccu-sun4i-a10.h      | 2 +-
+ include/dt-bindings/clock/sun4i-a10-ccu.h | 1 +
+ 3 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/clk/sunxi-ng/ccu-sun4i-a10.c b/drivers/clk/sunxi-ng/ccu-sun4i-a10.c
+index 409feb085..de44e7ce5 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun4i-a10.c
++++ b/drivers/clk/sunxi-ng/ccu-sun4i-a10.c
+@@ -697,9 +697,14 @@ static SUNXI_CCU_M_WITH_MUX_GATE(de_fe0_clk, "de-fe0", de_parents,
+ static SUNXI_CCU_M_WITH_MUX_GATE(de_fe1_clk, "de-fe1", de_parents,
+ 				 0x110, 0, 4, 24, 2, BIT(31), 0);
+ 
+-/* Undocumented on A10 */
++/*
++ * Undocumented on A10. The 2D engine is unrelated to the display, so keep
++ * it off the video PLLs, whose rates follow the display modes: the parent
++ * is set once (from the DT) and a rate change only adjusts the divider.
++ */
+ static SUNXI_CCU_M_WITH_MUX_GATE(de_mp_clk, "de-mp", de_parents,
+-				 0x114, 0, 4, 24, 2, BIT(31), 0);
++				 0x114, 0, 4, 24, 2, BIT(31),
++				 CLK_SET_RATE_NO_REPARENT);
+ 
+ static const char *const disp_parents[] = { "pll-video0", "pll-video1",
+ 					    "pll-video0-2x", "pll-video1-2x" };
+diff --git a/drivers/clk/sunxi-ng/ccu-sun4i-a10.h b/drivers/clk/sunxi-ng/ccu-sun4i-a10.h
+index 271b96236..5cd16717f 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun4i-a10.h
++++ b/drivers/clk/sunxi-ng/ccu-sun4i-a10.h
+@@ -24,7 +24,7 @@
+ #define CLK_PLL_VE		10
+ #define CLK_PLL_DDR_BASE	11
+ #define CLK_PLL_DDR		12
+-#define CLK_PLL_DDR_OTHER	13
++/* The PLL_DDR_OTHER clock is exported */
+ #define CLK_PLL_PERIPH_BASE	14
+ #define CLK_PLL_PERIPH		15
+ #define CLK_PLL_PERIPH_SATA	16
+diff --git a/include/dt-bindings/clock/sun4i-a10-ccu.h b/include/dt-bindings/clock/sun4i-a10-ccu.h
+index e4fa61be5..dbf4b164a 100644
+--- a/include/dt-bindings/clock/sun4i-a10-ccu.h
++++ b/include/dt-bindings/clock/sun4i-a10-ccu.h
+@@ -44,6 +44,7 @@
+ 
+ #define CLK_HOSC		1
+ #define CLK_PLL_VIDEO0_2X	9
++#define CLK_PLL_DDR_OTHER	13
+ #define CLK_PLL_VIDEO1_2X	18
+ #define CLK_CPU			20
+ 
+-- 
+2.55.0
+

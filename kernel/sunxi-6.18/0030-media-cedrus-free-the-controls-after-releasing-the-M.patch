@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Fri, 23 Oct 2026 12:07:58 +0200
+Subject: [PATCH] media: cedrus: free the controls after releasing the
+ M2M context
+
+Releasing the M2M context cancels both queues, and the queue cleanup
+completes the requests of the buffers still queued against the
+context's control handler. The handler was freed before that, so a file
+closed with requests in flight completed them against freed memory.
+
+Release the M2M context first, also in the error path of the context
+setup.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/staging/media/sunxi/cedrus/cedrus_context.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_context.c b/drivers/staging/media/sunxi/cedrus/cedrus_context.c
+index b4303f10c..aad81ec4a 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_context.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_context.c
+@@ -808,7 +808,11 @@ int cedrus_context_setup(struct cedrus_proc *proc, struct cedrus_context *ctx,
+ 	return 0;
+ 
+ error_ctrls:
++	v4l2_m2m_ctx_release(fh->m2m_ctx);
+ 	cedrus_context_ctrls_cleanup(ctx);
++	v4l2_fh_exit(fh);
++
++	return ret;
+ 
+ error_v4l2_m2m:
+ 	v4l2_m2m_ctx_release(fh->m2m_ctx);
+@@ -824,7 +828,12 @@ void cedrus_context_cleanup(struct cedrus_context *ctx, struct file *file)
+ 	cedrus_proc_context_active_clear(ctx->proc, ctx);
+ 
+ 	v4l2_fh_del(fh, file);
+-	cedrus_context_ctrls_cleanup(ctx);
++	/*
++	 * Releasing the M2M context cancels the queues, which completes the
++	 * requests of queued buffers against the control handler: free the
++	 * controls only afterwards.
++	 */
+ 	v4l2_m2m_ctx_release(fh->m2m_ctx);
++	cedrus_context_ctrls_cleanup(ctx);
+ 	v4l2_fh_exit(fh);
+ }
+-- 
+2.55.0
+

@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Fri, 30 Oct 2026 23:06:15 +0100
+Subject: [PATCH] wayland: experimental GST_WL_EXTRA_DMABUF format/modifier
+ pairs (MK802)
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ wayland/gstwldisplay.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/gst-libs/gst/wayland/gstwldisplay.c b/gst-libs/gst/wayland/gstwldisplay.c
+index abc8327..e38c2c7 100644
+--- a/gst-libs/gst/wayland/gstwldisplay.c
++++ b/gst-libs/gst/wayland/gstwldisplay.c
+@@ -473,6 +473,26 @@ gst_wl_display_new_existing (struct wl_display *display,
+     g_warning ("Could not bind to zwp_linux_dmabuf_v1");
+   }
+ 
++  /* Experimental (MK802): GST_WL_EXTRA_DMABUF="NV12:0x0900000000000001,..."
++   * adds format/modifier pairs the compositor can only scan out (not in its
++   * default dma-buf feedback). */
++  if (priv->dmabuf && g_getenv ("GST_WL_EXTRA_DMABUF")) {
++    gchar **pairs = g_strsplit (g_getenv ("GST_WL_EXTRA_DMABUF"), ",", -1);
++    for (gint i = 0; pairs[i]; i++) {
++      guint64 modifier;
++      guint32 fourcc = gst_video_dma_drm_fourcc_from_string (pairs[i],
++          &modifier);
++      if (fourcc == DRM_FORMAT_INVALID) {
++        GST_WARNING ("GST_WL_EXTRA_DMABUF: cannot parse '%s'", pairs[i]);
++        continue;
++      }
++      GST_INFO ("GST_WL_EXTRA_DMABUF: adding %s", pairs[i]);
++      g_array_append_val (priv->dmabuf_formats, fourcc);
++      g_array_append_val (priv->dmabuf_modifiers, modifier);
++    }
++    g_strfreev (pairs);
++  }
++
+   if (!priv->xdg_wm_base && !priv->fullscreen_shell) {
+     /* If wl_surface and wl_display are passed via GstContext
+      * xdg_shell and zwp_fullscreen_shell are not used.
+-- 
+2.55.0
+

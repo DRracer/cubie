@@ -1,0 +1,107 @@
+From 46b960ca5e8c99f9294a92696f2e4abb97582766 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Sun, 1 Nov 2026 20:42:37 +0100
+Subject: [PATCH 0/5] drm/lima: fix a heap-grow page fault and the recovery from MMU faults
+To: Qiang Yu <yuq825@gmail.com>
+Cc: Erico Nunes <nunes.erico@gmail.com>,
+    Danilo Krummrich <dakr@kernel.org>,
+    Maarten Lankhorst <maarten.lankhorst@linux.intel.com>,
+    Maxime Ripard <mripard@kernel.org>,
+    Thomas Zimmermann <tzimmermann@suse.de>,
+    David Airlie <airlied@gmail.com>,
+    Simona Vetter <simona@ffwll.ch>,
+    lima@lists.freedesktop.org,
+    dri-devel@lists.freedesktop.org,
+    linux-kernel@vger.kernel.org
+
+On an Allwinner A10 (Mali-400 MP1) desktop, short glmark2 runs wedge the
+GPU every few runs until a reboot:
+
+  lima 1c40000.gpu: gpmmu page fault at 0x45c9000 from bus id 0 of type read
+  lima 1c40000.gpu: gp task error int_state=0 status=a
+  lima 1c40000.gpu: gp bus stop timeout
+
+followed by a GP job timeout and the same bus stop timeout every 10 s.
+Two separate problems meet here.
+
+The trigger (patch 5): when the PLBU runs out of tile heap,
+lima_sched_recover_work() flushes the L2 cache and zaps the TLB before
+lima_gp_task_recover() maps the new heap pages, so the restarted PLBU can
+use a stale "not present" page table entry. The fault always hits the
+first page of the 32 -> 64 KiB grow of the tile heap of the second GP job
+of a new GL context, and the PTE is valid in memory at fault time. Mesa
+could avoid it by starting with a larger heap, but any heap grow can
+hit it, so the kernel has to flush in the right order.
+
+The recovery (patches 2-4): an MMU fault on a heap job is handled as
+out-of-heap (patch 2), the core is hard-reset while the MMU still holds
+the faulting transaction, so the bus never stops and the GPU stays dead
+(patch 3), and a queued heap recovery can run after the reset (patch 4).
+Patch 1 fixes an oops in the error task dump (lima.max_error_tasks > 0),
+which I hit while debugging this.
+
+Evidence per patch: 1 oops seen and gone; 2 and 3 the fault recovered
+instead of wedging the GPU (one fault seen with them); 4 found by review,
+not seen on hardware (no Cc: stable for it); 5 an A/B test, see below.
+
+The patches are independent of each other and apply in any order.
+Older stable trees will need context fixes, and patch 1 uses the
+two-argument strscpy() (v6.8+). Patch 3 is the largest: it adds a
+three-page "fault flush" page directory per device.
+
+Patches 3 and 5 refer to ARM's Mali-400 kernel driver (r3p0) for the
+order of operations only; the code is written for lima from scratch.
+
+Testing, all on Armbian 6.18.56 (its lima differs from drm-misc-next
+only in allocation helpers and includes), Mesa 25.0.7, Xorg, a loop of
+glmark2-es2 -b build:use-vbo=true -b shading:shading=gouraud
+-b bump:bump-render=high-poly:
+
+- Allwinner A10 (Mali-400 MP1, Rikomagic MK802):
+  - unpatched: the GPU wedged within about 10 runs;
+  - patches 1-4: the fault still occurs, and lima now recovers within
+    1 ms (the dependent PP job fails, rendering continues);
+  - with lima.heap_init_nr_pages=1 (many heap grows per frame): patches
+    1-4 faulted in 5 of 20 runs, patches 1-5 in 0 of 40;
+  - patches 1-5 with the default heap: 0 faults in 80 runs.
+- Allwinner A20 (Mali-400 MP2, Cubietruck): patches 1-5 run on the
+  desktop since 2026-11-01; this board had one fault at 0x9000 (tile
+  heap at VA 0x1000, the same grow step) followed by the same dead GPU
+  before. That fault is rare here, so this is no proof for the A20.
+- The version of patch 4 that ran on these boards cancelled the work
+  without the second irq mask; this one adds it after review.
+- Not tested: Mali-450 (patch 3 handles the broadcast MMU like
+  lima_mmu_page_fault_resume() does, but that path has not run), v7.x
+  kernels on hardware. The series builds with W=1 for ARM
+  (sunxi_defconfig) after each patch and for arm64 (defconfig).
+
+Left as they are: lima_heap_alloc() remaps the whole heap on every
+grow, the L2 flush result is not checked, and the heap recovery
+allocates memory in the fence signalling path.
+
+The patches and this letter were written with an AI assistant; I
+reviewed and tested them.
+
+D.R.racer (5):
+  drm/lima: do not use the scheduler entity when saving an error task
+  drm/lima: do not handle a GP MMU fault as an out-of-heap condition
+  drm/lima: let a faulted core finish its bus transactions before the
+    reset
+  drm/lima: cancel a pending heap recovery in the timeout handler
+  drm/lima: flush the L2 cache and TLB after growing the heap
+
+ drivers/gpu/drm/lima/lima_device.c | 31 ++++++++++++++++++---
+ drivers/gpu/drm/lima/lima_device.h |  3 +++
+ drivers/gpu/drm/lima/lima_gem.c    |  3 +++
+ drivers/gpu/drm/lima/lima_gp.c     | 12 +++++++++
+ drivers/gpu/drm/lima/lima_mmu.c    | 24 ++++++++++++++++-
+ drivers/gpu/drm/lima/lima_mmu.h    |  1 +
+ drivers/gpu/drm/lima/lima_sched.c  | 43 +++++++++++++++++++++---------
+ drivers/gpu/drm/lima/lima_sched.h  |  6 +++++
+ 8 files changed, 105 insertions(+), 18 deletions(-)
+
+
+base-commit: a1e63ab695ad76850ab9787b9eb6aab695dc2965
+-- 
+2.55.0
+

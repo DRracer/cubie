@@ -1,0 +1,40 @@
+From: "D.R.racer" <drracer@seznam.cz>
+Subject: [PATCH] v4l2codecs: map the sunxi tiled NV12 format to DRM
+
+The cedrus decoders return V4L2_PIX_FMT_SUNXI_TILED_NV12 (32x32 tiles),
+which the display engine of the A10/A20 scans out directly as
+DRM_FORMAT_NV12 with DRM_FORMAT_MOD_ALLWINNER_TILED. Map it, so that
+v4l2codecs can hand the decoded buffers to a DMA_DRM sink without a CPU
+copy. libgstvideo may not know the DRM mapping of NV12_32L32, so fall
+back to the table entry when it returns DRM_FORMAT_INVALID.
+
+Against the GStreamer monorepo, 1.26.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+diff --git a/subprojects/gst-plugins-bad/sys/v4l2codecs/gstv4l2format.c b/subprojects/gst-plugins-bad/sys/v4l2codecs/gstv4l2format.c
+index 9b58e7b..857e4ce 100644
+--- a/subprojects/gst-plugins-bad/sys/v4l2codecs/gstv4l2format.c
++++ b/subprojects/gst-plugins-bad/sys/v4l2codecs/gstv4l2format.c
+@@ -53,7 +53,7 @@ static const GstV4l2FormatDesc gst_v4l2_descriptions[] = {
+   {V4L2_PIX_FMT_P010,             GST_VIDEO_FORMAT_P010_10LE,       DRM_FORMAT_INVALID, DRM_FORMAT_MOD_INVALID, 0},
+   {V4L2_PIX_FMT_YUYV,             GST_VIDEO_FORMAT_YUY2,            DRM_FORMAT_INVALID, DRM_FORMAT_MOD_INVALID, 0},
+   {V4L2_PIX_FMT_MM21,             GST_VIDEO_FORMAT_NV12_16L32S,     DRM_FORMAT_INVALID, DRM_FORMAT_MOD_INVALID, 0},
+-  {V4L2_PIX_FMT_SUNXI_TILED_NV12, GST_VIDEO_FORMAT_NV12_32L32,      DRM_FORMAT_INVALID, DRM_FORMAT_MOD_INVALID, 0},
++  {V4L2_PIX_FMT_SUNXI_TILED_NV12, GST_VIDEO_FORMAT_NV12_32L32,      DRM_FORMAT_NV12,    DRM_FORMAT_MOD_ALLWINNER_TILED, 0},
+   {V4L2_PIX_FMT_NV12_4L4,         GST_VIDEO_FORMAT_NV12_4L4,        DRM_FORMAT_INVALID, DRM_FORMAT_MOD_INVALID, 0},
+   {V4L2_PIX_FMT_NC12,             GST_VIDEO_FORMAT_UNKNOWN,         DRM_FORMAT_NV12,    DRM_FORMAT_MOD_BROADCOM_SAND128, 2},
+   {V4L2_PIX_FMT_NV12,             GST_VIDEO_FORMAT_NV12,            DRM_FORMAT_INVALID, DRM_FORMAT_MOD_INVALID, 0},
+@@ -80,6 +80,12 @@ gst_v4l2_format_get_descriptions (void)
+             gst_video_dma_drm_format_from_gst_format (gst_v4l2_descriptions
+             [i].gst_fmt, &drm_modifier);
+         v4l2_descs[i].drm_modifier = drm_modifier;
++        /* libgstvideo may not know the mapping (e.g. NV12_32L32). */
++        if (v4l2_descs[i].drm_fourcc == DRM_FORMAT_INVALID &&
++            gst_v4l2_descriptions[i].drm_fourcc != DRM_FORMAT_INVALID) {
++          v4l2_descs[i].drm_fourcc = gst_v4l2_descriptions[i].drm_fourcc;
++          v4l2_descs[i].drm_modifier = gst_v4l2_descriptions[i].drm_modifier;
++        }
+ 
+         info = gst_video_format_get_info (gst_v4l2_descriptions[i].gst_fmt);
+         v4l2_descs[i].num_planes = GST_VIDEO_FORMAT_INFO_N_PLANES (info);

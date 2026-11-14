@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Fri, 30 Oct 2026 21:08:58 +0100
+Subject: [PATCH] drm/sun4i: hdmi: audio: do not depend on A20 register reset
+ values
+
+The A10 HDMI controller leaves non-zero values in the audio registers
+after reset (0x33 in the low byte of AUDIO_CTRL, AUDIO_FMT, STAT0, ...);
+the A20 resets them to 0. On the A10:
+- startup waits for AUDIO_CTRL to read 0 after the self-clearing reset,
+  which never happens, so every stream open fails after 50 ms with
+  "Failed to reset HDMI Audio" (-ETIMEDOUT);
+- hw_params read-modify-writes AUDIO_FMT and the channel status, which
+  would keep the stray bits (in the channel status: "professional",
+  "non-PCM data").
+
+Wait for the reset bit only, and write the format and the channel status
+in full. On the A20 the written values are unchanged.
+
+Tested on a Rikomagic MK802 (A10, 1 GiB).
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/sun4i/sun4i_hdmi_audio.c | 23 +++++++++--------------
+ 1 file changed, 9 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_hdmi_audio.c b/drivers/gpu/drm/sun4i/sun4i_hdmi_audio.c
+index a66b6c519..48db06de8 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_hdmi_audio.c
++++ b/drivers/gpu/drm/sun4i/sun4i_hdmi_audio.c
+@@ -82,7 +82,8 @@ static int sun4i_hdmi_audio_startup(struct snd_pcm_substream *substream,
+ 		     SUN4I_HDMI_AUDIO_CTRL_RESET);
+ 	ret = regmap_read_poll_timeout(hdmi->regmap,
+ 				       SUN4I_HDMI_AUDIO_CTRL_REG,
+-				       reg, !reg, 100, 50000);
++				       reg, !(reg & SUN4I_HDMI_AUDIO_CTRL_RESET),
++				       100, 50000);
+ 	if (ret < 0) {
+ 		DRM_ERROR("Failed to reset HDMI Audio\n");
+ 		return ret;
+@@ -198,10 +199,9 @@ static int sun4i_hdmi_audio_set_hw_rate(struct sun4i_hdmi *hdmi,
+ 		return -EINVAL;
+ 	}
+ 
+-	regmap_update_bits(hdmi->regmap,
+-			   SUN4I_HDMI_AUDIO_STAT0_REG,
+-			   SUN4I_HDMI_AUDIO_STAT0_FREQ_MASK,
+-			   SUN4I_HDMI_AUDIO_STAT0_FREQ(val));
++	/* Write the whole channel status: the A10 does not reset it to 0 */
++	regmap_write(hdmi->regmap, SUN4I_HDMI_AUDIO_STAT0_REG,
++		     SUN4I_HDMI_AUDIO_STAT0_FREQ(val));
+ 
+ 	return 0;
+ }
+@@ -216,15 +216,10 @@ static int sun4i_hdmi_audio_set_hw_channels(struct sun4i_hdmi *hdmi,
+ 
+ 	hdmi->audio.channels = channels;
+ 
+-	regmap_update_bits(hdmi->regmap,
+-			   SUN4I_HDMI_AUDIO_FMT_REG,
+-			   SUN4I_HDMI_AUDIO_FMT_LAYOUT,
+-			   (channels > 2) ? SUN4I_HDMI_AUDIO_FMT_LAYOUT : 0);
+-
+-	regmap_update_bits(hdmi->regmap,
+-			   SUN4I_HDMI_AUDIO_FMT_REG,
+-			   SUN4I_HDMI_AUDIO_FMT_CH_CFG_MASK,
+-			   SUN4I_HDMI_AUDIO_FMT_CH_CFG(channels));
++	/* Write the whole format: the A10 does not reset it to 0 */
++	regmap_write(hdmi->regmap, SUN4I_HDMI_AUDIO_FMT_REG,
++		     ((channels > 2) ? SUN4I_HDMI_AUDIO_FMT_LAYOUT : 0) |
++		     SUN4I_HDMI_AUDIO_FMT_CH_CFG(channels));
+ 
+ 	regmap_write(hdmi->regmap, SUN4I_HDMI_AUDIO_PCM_REG, 0x76543210);
+ 
+-- 
+2.55.0
+

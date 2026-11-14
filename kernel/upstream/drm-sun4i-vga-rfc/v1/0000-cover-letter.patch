@@ -1,0 +1,92 @@
+From 9e1c3db16b1bec9f3e1b10054403655a2f3d31f8 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Tue, 20 Oct 2026 06:56:40 +0200
+Subject: [RFC PATCH 0/3] drm/sun4i: VGA output on the A10/A20 TV encoder (Cubietruck)
+To: Chen-Yu Tsai <wens@kernel.org>,
+    Maxime Ripard <mripard@kernel.org>,
+    Jernej Skrabec <jernej.skrabec@gmail.com>,
+    Samuel Holland <samuel@sholland.org>
+Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>,
+    Thomas Zimmermann <tzimmermann@suse.de>,
+    David Airlie <airlied@gmail.com>,
+    Simona Vetter <simona@ffwll.ch>,
+    Rob Herring <robh@kernel.org>,
+    Krzysztof Kozlowski <krzk+dt@kernel.org>,
+    Conor Dooley <conor+dt@kernel.org>,
+    Philipp Zabel <p.zabel@pengutronix.de>,
+    dri-devel@lists.freedesktop.org,
+    devicetree@vger.kernel.org,
+    linux-arm-kernel@lists.infradead.org,
+    linux-sunxi@lists.linux.dev,
+    linux-kernel@vger.kernel.org
+
+The A10/A20 TV encoders can drive a VGA connector: in "VGA mode" three
+DACs output R, G and B straight from the display backend, and TCON
+channel 1 drives HSYNC/VSYNC. The Cubietruck wires its VGA connector
+this way and the vendor 3.4 kernel uses it as the default output, but
+mainline has no VGA support for it.
+
+Patch 1 lets the TCON drive a DAC (VGA) encoder on channel 1 and adds
+the missing TV encoder case to the A10/A20 output mux. Patch 2 adds a
+VGA mode to sun4i_tv when its output port links to a vga-connector, with
+EDID and detection over the connector's DDC bus. Patch 3 adds the A20 TV
+encoder nodes and the Cubietruck VGA output.
+
+The register values come from the vendor driver and were checked against
+a Cubietruck running it. Tested on a Cubietruck (A20, 2 GiB) with
+Armbian's 6.18.56 and a 1280x1024 monitor: VGA alone, EDID and hot-plug,
+DPMS, and VGA on TCON0 next to HDMI on TCON1. On v7.3-rc7 the series
+builds with W=1; patch 2 needed a small rebase there (drm_encoder_init()
+instead of drm_simple_encoder_init()) that was not run on hardware.
+
+This is an RFC because of open design questions:
+
+- Binding: allwinner,sun4i-a10-tv-encoder.yaml allows a single input
+  "port" and requires "resets". Patch 3 uses "ports" (input and output)
+  and no resets, so dtbs_check fails. A binding patch would add an
+  output port; is that the way to go, or a separate A20 compatible?
+- Reset: VGA works with the TV encoder's reset bit untouched (as the
+  vendor driver leaves it), so patch 2 makes the reset optional for VGA.
+  The A20 CCU does have RST_TVE0/1; VGA with that reset described and
+  deasserted has not been tested yet.
+- Connector: the VGA connector lives inside sun4i_tv. Would you rather
+  see the generic display-connector bridge (vga-connector with
+  ddc-i2c-bus) attached to the encoder?
+- The output mux is keyed on the TCON id (TV encoder n is fed by TCON n
+  only), which is how the device tree wires it.
+- Known issue: an earlier version looked up the DDC adapter in the
+  component bind and returned -EPROBE_DEFER there; the half-bound
+  pipeline was torn down and the boot hung. This version no longer
+  defers in bind for the DDC bus (the existing possible_crtcs check in
+  bind still can), and why the teardown after a bind-time deferral hung
+  was not analysed.
+
+Two related fixes found during this work are posted separately: the
+frontend routing of the second display pipeline, needed for video planes
+on the second CRTC, and the backend hardware cursor.
+
+Patch 3 is based on Chen-Yu Tsai's 2019 device tree work for the same
+board (sun4i-drm-tve-vga-wip, linked in the patch). Chen-Yu, would you
+prefer a Co-developed-by: there?
+
+Investigation and patches were done with an AI assistant; I reviewed the
+result and tested it on the hardware named above.
+
+D.R.racer (3):
+  drm/sun4i: tcon: support the TV encoder as VGA output on A10/A20
+  drm/sun4i: tv: add VGA output for A10/A20
+  ARM: dts: sun7i: add the TV encoders and the Cubietruck VGA output
+
+ .../dts/allwinner/sun7i-a20-cubietruck.dts    |  31 ++
+ arch/arm/boot/dts/allwinner/sun7i-a20.dtsi    |  60 ++++
+ drivers/gpu/drm/sun4i/sun4i_drv.c             |   3 +-
+ drivers/gpu/drm/sun4i/sun4i_tcon.c            |  27 ++
+ drivers/gpu/drm/sun4i/sun4i_tcon.h            |   3 +
+ drivers/gpu/drm/sun4i/sun4i_tv.c              | 287 +++++++++++++++---
+ 6 files changed, 372 insertions(+), 39 deletions(-)
+
+
+base-commit: f909e534f5e34feb2ea2701d54df63e21aa506fc
+-- 
+2.55.0
+

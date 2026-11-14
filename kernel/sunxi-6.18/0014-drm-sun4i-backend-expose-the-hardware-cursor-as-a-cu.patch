@@ -1,0 +1,560 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Sun, 18 Oct 2026 13:31:46 +0200
+Subject: [PATCH] drm/sun4i: backend: expose the hardware cursor as a
+ cursor plane
+
+The A10/A20 display backend has a hardware cursor unit of its own,
+separate from its four layers and drawn above them: 32x32 pixels at 8
+bits per pixel through a palette of 256 ARGB8888 colours (or larger
+cursors at fewer bits per pixel). sun4i-drm does not use it, so X falls
+back to a software cursor and redraws it on every mouse move; on a
+Cubietruck that is enough to make video playback miss frames while the
+mouse moves. The vendor 3.4 stack (fbturbo) used the unit.
+
+Expose it as a 32x32 ARGB8888 cursor plane. A new image is converted
+into palette and indices when it changes (straight alpha, index 0
+transparent; an image with more than 255 colours loses low bits per
+channel until it fits); a move only rewrites the position registers.
+A cursor partly above or left of the screen uses the unit's start
+offsets. Moving a visible cursor with the same image is an async plane
+update (written immediately, latched at the next vblank); sun4i's
+atomic_check now makes the async decision for legacy cursor updates
+like drm_atomic_helper_check() does, and the async path is not taken
+while another commit on the CRTC is still being programmed.
+
+Cursor-only commits must not involve the layers: the backend's
+atomic_check used to add every layer plane of the CRTC to the state
+(ruling out the single-plane async update and reprogramming all
+layers, frontend included, on every mouse move), and atomic_begin
+waited for the previous register load, i.e. one vblank per move. With
+a 125 Hz mouse that blocked the X server in the cursor ioctl: the
+cursor trailed the mouse by up to a second, other windows stopped
+repainting while it moved, and the timer interrupt rate rose from
+about 600/s to 8500/s (the 100 us load poll).
+
+The plane has an immutable zpos above the layers so that zpos
+normalisation keeps the layers' order, and the backend's layer check
+skips it. The DRM cursor size is set to 32x32 so that userspace sizes
+its cursors accordingly.
+
+Register layout from the A20 user manual (DEBE_HWCCTL_REG,
+DEBE_HWCFBCTL_REG, HWC pattern memory and palette).
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/sun4i/sun4i_backend.c     |  13 +-
+ drivers/gpu/drm/sun4i/sun4i_backend.h     |   7 +
+ drivers/gpu/drm/sun4i/sun4i_crtc.c        |  11 +-
+ drivers/gpu/drm/sun4i/sun4i_crtc.h        |  27 ++
+ drivers/gpu/drm/sun4i/sun4i_framebuffer.c |  14 +-
+ drivers/gpu/drm/sun4i/sun4i_layer.c       | 314 +++++++++++++++++++++-
+ 6 files changed, 380 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.c b/drivers/gpu/drm/sun4i/sun4i_backend.c
+index 9b8b649e5..dad55e123 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -26,6 +26,7 @@
+ #include <drm/drm_probe_helper.h>
+ 
+ #include "sun4i_backend.h"
++#include "sun4i_crtc.h"
+ #include "sun4i_drv.h"
+ #include "sun4i_frontend.h"
+ #include "sun4i_layer.h"
+@@ -499,10 +500,20 @@ static int sun4i_backend_atomic_check(struct sunxi_engine *engine,
+ 
+ 	DRM_DEBUG_DRIVER("Starting checking our planes\n");
+ 
+-	if (!crtc_state->planes_changed)
++	/*
++	 * A cursor move sets planes_changed too; checking the layers would add
++	 * them all to the state, making every move a full commit (and ruling
++	 * out the cursor's async update, which needs a single-plane state).
++	 */
++	if (!crtc_state->planes_changed ||
++	    sun4i_crtc_cursor_only(state, crtc_state->crtc))
+ 		return 0;
+ 
+ 	drm_for_each_plane_mask(plane, drm, crtc_state->plane_mask) {
++		/* the hardware cursor is not a layer */
++		if (plane->type == DRM_PLANE_TYPE_CURSOR)
++			continue;
++
+ 		struct drm_plane_state *plane_state =
+ 			drm_atomic_get_plane_state(state, plane);
+ 		if (IS_ERR(plane_state))
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.h b/drivers/gpu/drm/sun4i/sun4i_backend.h
+index 8fb7bf636..f47493de3 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.h
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.h
+@@ -105,7 +105,14 @@
+ #define SUN4I_BACKEND_REG_LOAD_FINISHED			BIT(1)
+ 
+ #define SUN4I_BACKEND_HWCCTL_REG		0x8d8
++#define SUN4I_BACKEND_HWCCTL_YCOOR(y)			((y) << 16)
++#define SUN4I_BACKEND_HWCCTL_XCOOR(x)			(x)
+ #define SUN4I_BACKEND_HWCFBCTL_REG		0x8e0
++#define SUN4I_BACKEND_HWCFBCTL_YCOOROFF(y)		((y) << 24)
++#define SUN4I_BACKEND_HWCFBCTL_XCOOROFF(x)		((x) << 16)
++#define SUN4I_BACKEND_HWCFBCTL_YSIZE_32			(0 << 4)
++#define SUN4I_BACKEND_HWCFBCTL_XSIZE_32			(0 << 2)
++#define SUN4I_BACKEND_HWCFBCTL_FBFMT_8BPP		(3 << 0)
+ #define SUN4I_BACKEND_WBCTL_REG			0x8f0
+ #define SUN4I_BACKEND_WBADD_REG			0x8f4
+ #define SUN4I_BACKEND_WBLINEWIDTH_REG		0x8f8
+diff --git a/drivers/gpu/drm/sun4i/sun4i_crtc.c b/drivers/gpu/drm/sun4i/sun4i_crtc.c
+index 3e90aeb68..3249b0626 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_crtc.c
++++ b/drivers/gpu/drm/sun4i/sun4i_crtc.c
+@@ -79,7 +79,13 @@ static void sun4i_crtc_atomic_begin(struct drm_crtc *crtc,
+ 		crtc->state->event = NULL;
+ 	}
+ 
+-	if (engine->ops->atomic_begin)
++	/*
++	 * The backend waits here for the previous commit's register load (the
++	 * next vblank) before the layers are reprogrammed. A cursor-only commit
++	 * rewrites just the cursor registers and need not wait: blocking each
++	 * mouse move for a frame stalls the X server.
++	 */
++	if (engine->ops->atomic_begin && !sun4i_crtc_cursor_only(state, crtc))
+ 		engine->ops->atomic_begin(engine, old_state);
+ }
+ 
+@@ -248,7 +254,8 @@ struct sun4i_crtc *sun4i_crtc_init(struct drm_device *drm,
+ 		uint32_t possible_crtcs = drm_crtc_mask(&scrtc->crtc);
+ 		struct drm_plane *plane = planes[i];
+ 
+-		if (plane->type == DRM_PLANE_TYPE_OVERLAY)
++		if (plane->type == DRM_PLANE_TYPE_OVERLAY ||
++		    plane->type == DRM_PLANE_TYPE_CURSOR)
+ 			plane->possible_crtcs = possible_crtcs;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/sun4i/sun4i_crtc.h b/drivers/gpu/drm/sun4i/sun4i_crtc.h
+index ed7aa7ce4..11fe16a65 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_crtc.h
++++ b/drivers/gpu/drm/sun4i/sun4i_crtc.h
+@@ -9,6 +9,9 @@
+ #ifndef _SUN4I_CRTC_H_
+ #define _SUN4I_CRTC_H_
+ 
++#include <drm/drm_atomic.h>
++#include <drm/drm_plane.h>
++
+ struct sun4i_crtc {
+ 	struct drm_crtc			crtc;
+ 	struct drm_pending_vblank_event	*event;
+@@ -22,6 +25,30 @@ static inline struct sun4i_crtc *drm_crtc_to_sun4i_crtc(struct drm_crtc *crtc)
+ 	return container_of(crtc, struct sun4i_crtc, crtc);
+ }
+ 
++/*
++ * True if the commit touches only the hardware cursor of @crtc: no layer
++ * plane on it is part of the state and no modeset is needed. Such commits
++ * must not reprogram the layers or wait for their register load.
++ */
++static inline bool sun4i_crtc_cursor_only(struct drm_atomic_state *state,
++					  struct drm_crtc *crtc)
++{
++	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
++	struct drm_plane_state *old_state, *new_state;
++	struct drm_plane *plane;
++	int i;
++
++	if (crtc_state && drm_atomic_crtc_needs_modeset(crtc_state))
++		return false;
++
++	for_each_oldnew_plane_in_state(state, plane, old_state, new_state, i)
++		if (plane->type != DRM_PLANE_TYPE_CURSOR &&
++		    (old_state->crtc == crtc || new_state->crtc == crtc))
++			return false;
++
++	return true;
++}
++
+ struct sun4i_crtc *sun4i_crtc_init(struct drm_device *drm,
+ 				   struct sunxi_engine *engine,
+ 				   struct sun4i_tcon *tcon);
+diff --git a/drivers/gpu/drm/sun4i/sun4i_framebuffer.c b/drivers/gpu/drm/sun4i/sun4i_framebuffer.c
+index 260136d60..9f0665189 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_framebuffer.c
++++ b/drivers/gpu/drm/sun4i/sun4i_framebuffer.c
+@@ -27,7 +27,15 @@ static int sun4i_de_atomic_check(struct drm_device *dev,
+ 	if (ret)
+ 		return ret;
+ 
+-	return drm_atomic_helper_check_planes(dev, state);
++	ret = drm_atomic_helper_check_planes(dev, state);
++	if (ret)
++		return ret;
++
++	/* cursor moves may skip the commit queue (see drm_atomic_helper_check()) */
++	if (state->legacy_cursor_update)
++		state->async_update = !drm_atomic_helper_async_check(dev, state);
++
++	return 0;
+ }
+ 
+ static const struct drm_mode_config_funcs sun4i_de_mode_config_funcs = {
+@@ -47,6 +55,10 @@ void sun4i_framebuffer_init(struct drm_device *drm)
+ 	drm->mode_config.max_width = 8192;
+ 	drm->mode_config.max_height = 8192;
+ 
++	/* the A10/A20 backend's hardware cursor is used at 32x32 */
++	drm->mode_config.cursor_width = 32;
++	drm->mode_config.cursor_height = 32;
++
+ 	drm->mode_config.funcs = &sun4i_de_mode_config_funcs;
+ 	drm->mode_config.helper_private = &sun4i_de_mode_config_helpers;
+ }
+diff --git a/drivers/gpu/drm/sun4i/sun4i_layer.c b/drivers/gpu/drm/sun4i/sun4i_layer.c
+index 01f535ffc..9d8773480 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_layer.c
++++ b/drivers/gpu/drm/sun4i/sun4i_layer.c
+@@ -11,6 +11,10 @@
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_blend.h>
++#include <drm/drm_fb_dma_helper.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_gem_dma_helper.h>
+ #include <drm/drm_gem_atomic_helper.h>
+ 
+ #include "sun4i_backend.h"
+@@ -245,6 +249,306 @@ static struct sun4i_layer *sun4i_layer_init_one(struct drm_device *drm,
+ 	return layer;
+ }
+ 
++/*
++ * Hardware cursor: the backend has a cursor unit of its own, separate from
++ * the four layers and drawn above them. It is used at 32x32 pixels with 8
++ * bits per pixel indexing a palette of 256 ARGB8888 colours. A new image is
++ * converted to palette and indices; moving the cursor only rewrites its
++ * position. Without it X draws the cursor in software, which costs a redraw
++ * on every mouse move.
++ */
++#define SUN4I_CURSOR_SIZE	32
++
++struct sun4i_cursor {
++	struct drm_plane	plane;
++	struct sun4i_backend	*backend;
++	u32			palette[256];
++	u32			pattern[SUN4I_CURSOR_SIZE * SUN4I_CURSOR_SIZE / 4];
++};
++
++static inline struct sun4i_cursor *plane_to_sun4i_cursor(struct drm_plane *plane)
++{
++	return container_of(plane, struct sun4i_cursor, plane);
++}
++
++static const uint32_t sun4i_cursor_formats[] = {
++	DRM_FORMAT_ARGB8888,
++};
++
++/* Straight (non-premultiplied) ARGB, low `shift` bits of each channel cleared. */
++static u32 sun4i_cursor_color(u32 argb, unsigned int shift)
++{
++	u32 a = argb >> 24, mask = 0xff & ~((1U << shift) - 1);
++	u32 r = (argb >> 16) & 0xff, g = (argb >> 8) & 0xff, b = argb & 0xff;
++
++	/* DRM cursor images are premultiplied, the blender expects straight colour */
++	r = min(r * 255 / a, 255U);
++	g = min(g * 255 / a, 255U);
++	b = min(b * 255 / a, 255U);
++
++	return (a & mask) << 24 | (r & mask) << 16 | (g & mask) << 8 | (b & mask);
++}
++
++/*
++ * Convert the image to palette and indices; index 0 is transparent. Images
++ * with more than 255 distinct colours lose low bits per channel until they fit.
++ */
++static void sun4i_cursor_load(struct sun4i_cursor *cursor,
++			      struct drm_plane_state *state)
++{
++	struct drm_framebuffer *fb = state->fb;
++	struct drm_gem_dma_object *obj = drm_fb_dma_get_gem_obj(fb, 0);
++	unsigned int w = min(state->src_w >> 16, (u32)SUN4I_CURSOR_SIZE);
++	unsigned int h = min(state->src_h >> 16, (u32)SUN4I_CURSOR_SIZE);
++	const u8 *src = (const u8 *)obj->vaddr + fb->offsets[0] +
++			(state->src_y >> 16) * fb->pitches[0] + (state->src_x >> 16) * 4;
++	u8 *index = (u8 *)cursor->pattern;
++	struct regmap *regs = cursor->backend->engine.regs;
++	unsigned int shift, count = 1;
++
++	for (shift = 0; shift < 8; shift++) {
++		unsigned int x, y;
++
++		memset(cursor->palette, 0, sizeof(cursor->palette));
++		memset(cursor->pattern, 0, sizeof(cursor->pattern));
++		count = 1;
++
++		for (y = 0; y < h && count <= 256; y++) {
++			const u32 *line = (const u32 *)(src + y * fb->pitches[0]);
++
++			for (x = 0; x < w; x++) {
++				unsigned int i;
++				u32 color;
++
++				if (!(line[x] >> 24))
++					continue;
++
++				color = sun4i_cursor_color(line[x], shift);
++				for (i = 1; i < count; i++)
++					if (cursor->palette[i] == color)
++						break;
++				if (i == count) {
++					if (count == 256) {
++						count++;
++						break;
++					}
++					cursor->palette[count++] = color;
++				}
++				index[y * SUN4I_CURSOR_SIZE + x] = i;
++			}
++		}
++		if (count <= 256)
++			break;
++	}
++
++	regmap_bulk_write(regs, SUN4I_BACKEND_HWCCOLORTAB_OFF, cursor->palette,
++			  ARRAY_SIZE(cursor->palette));
++	regmap_bulk_write(regs, SUN4I_BACKEND_HWCPATTERN_OFF, cursor->pattern,
++			  ARRAY_SIZE(cursor->pattern));
++}
++
++static int sun4i_cursor_atomic_check(struct drm_plane *plane,
++				     struct drm_atomic_state *state)
++{
++	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
++	struct drm_crtc_state *crtc_state;
++	int ret;
++
++	if (!new_state->crtc)
++		return 0;
++
++	crtc_state = drm_atomic_get_new_crtc_state(state, new_state->crtc);
++	if (WARN_ON(!crtc_state))
++		return -EINVAL;
++
++	ret = drm_atomic_helper_check_plane_state(new_state, crtc_state,
++						  DRM_PLANE_NO_SCALING,
++						  DRM_PLANE_NO_SCALING,
++						  true, true);
++	if (ret || !new_state->visible)
++		return ret;
++
++	if (new_state->crtc_w > SUN4I_CURSOR_SIZE ||
++	    new_state->crtc_h > SUN4I_CURSOR_SIZE)
++		return -EINVAL;
++
++	/* the image is read by the CPU */
++	if (!drm_fb_dma_get_gem_obj(new_state->fb, 0)->vaddr)
++		return -EINVAL;
++
++	return 0;
++}
++
++static void sun4i_cursor_set_position(struct regmap *regs,
++				      struct drm_plane_state *state)
++{
++	int x = state->crtc_x, y = state->crtc_y;
++	unsigned int xoff = 0, yoff = 0;
++
++	/* a cursor partly above or left of the screen starts inside the image */
++	if (x < 0) {
++		xoff = -x;
++		x = 0;
++	}
++	if (y < 0) {
++		yoff = -y;
++		y = 0;
++	}
++	regmap_write(regs, SUN4I_BACKEND_HWCCTL_REG,
++		     SUN4I_BACKEND_HWCCTL_YCOOR(y) | SUN4I_BACKEND_HWCCTL_XCOOR(x));
++	regmap_write(regs, SUN4I_BACKEND_HWCFBCTL_REG,
++		     SUN4I_BACKEND_HWCFBCTL_YCOOROFF(yoff) |
++		     SUN4I_BACKEND_HWCFBCTL_XCOOROFF(xoff) |
++		     SUN4I_BACKEND_HWCFBCTL_YSIZE_32 |
++		     SUN4I_BACKEND_HWCFBCTL_XSIZE_32 |
++		     SUN4I_BACKEND_HWCFBCTL_FBFMT_8BPP);
++}
++
++static void sun4i_cursor_atomic_update(struct drm_plane *plane,
++				       struct drm_atomic_state *state)
++{
++	struct drm_plane_state *old_state = drm_atomic_get_old_plane_state(state, plane);
++	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
++	struct sun4i_cursor *cursor = plane_to_sun4i_cursor(plane);
++	struct regmap *regs = cursor->backend->engine.regs;
++
++	if (!new_state->visible) {
++		regmap_update_bits(regs, SUN4I_BACKEND_MODCTL_REG,
++				   SUN4I_BACKEND_MODCTL_HWC_EN, 0);
++		return;
++	}
++
++	if (new_state->fb != old_state->fb || !old_state->visible)
++		sun4i_cursor_load(cursor, new_state);
++
++	sun4i_cursor_set_position(regs, new_state);
++	regmap_update_bits(regs, SUN4I_BACKEND_MODCTL_REG,
++			   SUN4I_BACKEND_MODCTL_HWC_EN,
++			   SUN4I_BACKEND_MODCTL_HWC_EN);
++}
++
++/*
++ * Moving a visible cursor (same image) bypasses the commit queue: queued
++ * full commits per mouse move made the cursor lag, and could land out of
++ * order and show it briefly at an older position. The new position is
++ * latched by the backend at the next vblank.
++ */
++static int sun4i_cursor_atomic_async_check(struct drm_plane *plane,
++					   struct drm_atomic_state *state,
++					   bool flip)
++{
++	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
++	struct drm_crtc_state *crtc_state;
++	struct drm_crtc_commit *commit;
++	int ret;
++
++	if (!plane->state || !plane->state->visible ||
++	    new_state->fb != plane->state->fb)
++		return -EINVAL;
++
++	crtc_state = drm_atomic_get_new_crtc_state(state, new_state->crtc);
++	if (!crtc_state || !crtc_state->active)
++		return -EINVAL;
++
++	/*
++	 * The async update triggers a register load; with another commit on
++	 * this CRTC still being programmed it would latch half of its layer
++	 * registers. Take the normal path then.
++	 */
++	commit = new_state->crtc->state->commit;
++	if (commit && !try_wait_for_completion(&commit->hw_done))
++		return -EBUSY;
++
++	ret = drm_atomic_helper_check_plane_state(new_state, crtc_state,
++						  DRM_PLANE_NO_SCALING,
++						  DRM_PLANE_NO_SCALING,
++						  true, true);
++	if (ret || !new_state->visible)
++		return -EINVAL;
++
++	return 0;
++}
++
++static void sun4i_cursor_atomic_async_update(struct drm_plane *plane,
++					     struct drm_atomic_state *state)
++{
++	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
++	struct sun4i_cursor *cursor = plane_to_sun4i_cursor(plane);
++	struct regmap *regs = cursor->backend->engine.regs;
++
++	swap(plane->state->fb, new_state->fb);
++	plane->state->crtc_x = new_state->crtc_x;
++	plane->state->crtc_y = new_state->crtc_y;
++	plane->state->crtc_w = new_state->crtc_w;
++	plane->state->crtc_h = new_state->crtc_h;
++	plane->state->src_x = new_state->src_x;
++	plane->state->src_y = new_state->src_y;
++	plane->state->src_w = new_state->src_w;
++	plane->state->src_h = new_state->src_h;
++	plane->state->src = new_state->src;
++	plane->state->dst = new_state->dst;
++
++	sun4i_cursor_set_position(regs, plane->state);
++	regmap_write(regs, SUN4I_BACKEND_REGBUFFCTL_REG,
++		     SUN4I_BACKEND_REGBUFFCTL_AUTOLOAD_DIS |
++		     SUN4I_BACKEND_REGBUFFCTL_LOADCTL);
++}
++
++static void sun4i_cursor_atomic_disable(struct drm_plane *plane,
++					struct drm_atomic_state *state)
++{
++	struct sun4i_cursor *cursor = plane_to_sun4i_cursor(plane);
++
++	regmap_update_bits(cursor->backend->engine.regs, SUN4I_BACKEND_MODCTL_REG,
++			   SUN4I_BACKEND_MODCTL_HWC_EN, 0);
++}
++
++static const struct drm_plane_helper_funcs sun4i_cursor_helper_funcs = {
++	.atomic_check		= sun4i_cursor_atomic_check,
++	.atomic_update		= sun4i_cursor_atomic_update,
++	.atomic_disable		= sun4i_cursor_atomic_disable,
++	.atomic_async_check	= sun4i_cursor_atomic_async_check,
++	.atomic_async_update	= sun4i_cursor_atomic_async_update,
++};
++
++static const struct drm_plane_funcs sun4i_cursor_funcs = {
++	.update_plane		= drm_atomic_helper_update_plane,
++	.disable_plane		= drm_atomic_helper_disable_plane,
++	.destroy		= drm_plane_cleanup,
++	.reset			= drm_atomic_helper_plane_reset,
++	.atomic_duplicate_state	= drm_atomic_helper_plane_duplicate_state,
++	.atomic_destroy_state	= drm_atomic_helper_plane_destroy_state,
++};
++
++static struct drm_plane *sun4i_cursor_init(struct drm_device *drm,
++					   struct sun4i_backend *backend)
++{
++	struct sun4i_cursor *cursor;
++	int ret;
++
++	cursor = devm_kzalloc(drm->dev, sizeof(*cursor), GFP_KERNEL);
++	if (!cursor)
++		return ERR_PTR(-ENOMEM);
++
++	cursor->backend = backend;
++
++	/* possible crtcs are set later */
++	ret = drm_universal_plane_init(drm, &cursor->plane, 0,
++				       &sun4i_cursor_funcs,
++				       sun4i_cursor_formats,
++				       ARRAY_SIZE(sun4i_cursor_formats),
++				       NULL, DRM_PLANE_TYPE_CURSOR, NULL);
++	if (ret)
++		return ERR_PTR(ret);
++
++	drm_plane_helper_add(&cursor->plane, &sun4i_cursor_helper_funcs);
++	/* above all layers, so that zpos normalisation keeps their order */
++	drm_plane_create_zpos_immutable_property(&cursor->plane,
++						 SUN4I_BACKEND_NUM_LAYERS);
++
++	return &cursor->plane;
++}
++
+ struct drm_plane **sun4i_layers_init(struct drm_device *drm,
+ 				     struct sunxi_engine *engine)
+ {
+@@ -252,8 +556,8 @@ struct drm_plane **sun4i_layers_init(struct drm_device *drm,
+ 	struct sun4i_backend *backend = engine_to_sun4i_backend(engine);
+ 	int i;
+ 
+-	/* We need to have a sentinel at the need, hence the overallocation */
+-	planes = devm_kcalloc(drm->dev, SUN4I_BACKEND_NUM_LAYERS + 1,
++	/* layers, the cursor and a sentinel at the end */
++	planes = devm_kcalloc(drm->dev, SUN4I_BACKEND_NUM_LAYERS + 2,
+ 			      sizeof(*planes), GFP_KERNEL);
+ 	if (!planes)
+ 		return ERR_PTR(-ENOMEM);
+@@ -272,5 +576,11 @@ struct drm_plane **sun4i_layers_init(struct drm_device *drm,
+ 		planes[i] = &layer->plane;
+ 	}
+ 
++	planes[i] = sun4i_cursor_init(drm, backend);
++	if (IS_ERR(planes[i])) {
++		dev_err(drm->dev, "Couldn't initialize the cursor plane\n");
++		return ERR_CAST(planes[i]);
++	}
++
+ 	return planes;
+ }
+-- 
+2.55.0
+

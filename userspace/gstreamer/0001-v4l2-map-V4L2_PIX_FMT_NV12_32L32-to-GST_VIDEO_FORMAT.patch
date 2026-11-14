@@ -1,0 +1,39 @@
+From e377c2c0bc13176b3625679381c2095ddd282f3d Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Wed, 28 Oct 2026 14:13:32 +0100
+Subject: [PATCH] v4l2: map V4L2_PIX_FMT_NV12_32L32 to
+ GST_VIDEO_FORMAT_NV12_32L32
+
+The Allwinner cedrus decoders return 32x32-tiled NV12 (ST12) on their
+CAPTURE queue. Without a mapping the stateful JPEG decoder node is
+skipped at registration (no raw CAPTURE format left). GstVideoFormat
+NV12_32L32 and its unpacker already exist.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ sys/v4l2/gstv4l2object.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/sys/v4l2/gstv4l2object.c b/sys/v4l2/gstv4l2object.c
+index 80189d2..6e453c8 100644
+--- a/sys/v4l2/gstv4l2object.c
++++ b/sys/v4l2/gstv4l2object.c
+@@ -191,6 +191,7 @@ static GstV4L2FormatDesc gst_v4l2_formats[] = {
+   {MAP_FMT (NV24, NV24),                        KNOWN_DRM_MAP,                      GST_V4L2_RAW},
+   {MAP_FMT (NV42, UNKNOWN),                     MAP_DRM (NV42, LINEAR),             GST_V4L2_RAW},
+   {MAP_FMT (MM21, NV12_16L32S),                 KNOWN_DRM_MAP,                      GST_V4L2_RAW},
++  {MAP_FMT (NV12_32L32, NV12_32L32),           KNOWN_DRM_MAP,                      GST_V4L2_RAW},
+   {MAP_FMT (P010, P010_10LE),                   KNOWN_DRM_MAP,                      GST_V4L2_RAW},
+ 
+   /* Bayer formats - see http://www.siliconimaging.com/RGB%20Bayer.htm */
+@@ -1165,6 +1166,7 @@ gst_v4l2_object_format_get_rank (const struct v4l2_fmtdesc *fmt)
+     case V4L2_PIX_FMT_NV61M:   /* Same as NV61      */
+     case V4L2_PIX_FMT_NV24:    /* 24  Y/CrCb 4:4:4  */
+     case V4L2_PIX_FMT_MM21:    /* NV12 Y 16x32, UV 16x16 tile */
++    case V4L2_PIX_FMT_NV12_32L32:      /* NV12 32x32 tile */
+     case V4L2_PIX_FMT_NV12M_8L128:
+     case V4L2_PIX_FMT_NV12M_10BE_8L128:
+       rank = YUV_ODD_BASE_RANK;
+-- 
+2.55.0
+

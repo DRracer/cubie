@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Fri, 30 Oct 2026 23:04:19 +0100
+Subject: [PATCH] backend-drm: import dmabufs into KMS directly when GBM
+ refuses them
+
+drm_fb_get_from_dmabuf() imports client dmabufs through the GBM device,
+so a buffer whose format modifier only the display engine understands
+never reaches a plane. On Allwinner A10/A20 the lima GBM device rejects
+DRM_FORMAT_MOD_ALLWINNER_TILED, the layout of the video engine's
+decoder output, while the sun4i-drm planes accept it.
+
+When the GBM import fails, import the dmabuf with drmPrimeFDToHandle()
+into the KMS device, with the per-device GEM handle reference counting
+that the scanout-device import already uses.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ libweston/backend-drm/fb.c | 37 +++++++++++++++++++++++++++++++++++--
+ 1 file changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/libweston/backend-drm/fb.c b/libweston/backend-drm/fb.c
+index 05fba0c..ec46af5 100644
+--- a/libweston/backend-drm/fb.c
++++ b/libweston/backend-drm/fb.c
+@@ -150,6 +150,38 @@ out:
+ 	close(bo_fd);
+ 	return ret;
+ }
++
++/*
++ * Import a dmabuf straight into the KMS device, for buffers the GBM device
++ * refuses although a plane can scan them out (e.g. a format modifier that
++ * only the display engine understands, such as the Allwinner video engine's
++ * tiled NV12, which the lima GBM device rejects). The GEM handles are
++ * reference counted per device, as for drm_fb_import_plane().
++ */
++static int
++drm_fb_import_dmabuf_direct(struct drm_device *device, struct drm_fb *fb,
++			    struct linux_dmabuf_buffer *dmabuf)
++{
++	uint32_t handle;
++	int i;
++
++	for (i = 0; i < dmabuf->attributes.n_planes; i++) {
++		if (drmPrimeFDToHandle(device->drm.fd,
++				       dmabuf->attributes.fd[i], &handle))
++			goto err;
++		fb->handles[i] = gem_handle_get(device, handle);
++	}
++	fb->scanout_device = device;
++
++	return 0;
++
++err:
++	for (i--; i >= 0; i--) {
++		gem_handle_put(device, fb->handles[i]);
++		fb->handles[i] = 0;
++	}
++	return -1;
++}
+ #endif
+ 
+ /*
+@@ -427,7 +459,8 @@ drm_fb_get_from_dmabuf(struct linux_dmabuf_buffer *dmabuf,
+ 
+ 	fb->bo = gbm_bo_import(backend->gbm, GBM_BO_IMPORT_FD_MODIFIER,
+ 			       &import_mod, GBM_BO_USE_SCANOUT);
+-	if (!fb->bo) {
++	if (!fb->bo &&
++	    drm_fb_import_dmabuf_direct(device, fb, dmabuf) < 0) {
+ 		if (try_view_on_plane_failure_reasons)
+ 			*try_view_on_plane_failure_reasons |=
+ 				FAILURE_REASONS_GBM_BO_IMPORT_FAILED;
+@@ -462,7 +495,7 @@ drm_fb_get_from_dmabuf(struct linux_dmabuf_buffer *dmabuf,
+ 	}
+ 
+ 	fb->num_planes = dmabuf->attributes.n_planes;
+-	for (i = 0; i < dmabuf->attributes.n_planes; i++) {
++	for (i = 0; fb->bo && i < dmabuf->attributes.n_planes; i++) {
+ 		union gbm_bo_handle handle;
+ 
+ 	        handle = gbm_bo_get_handle_for_plane(fb->bo, i);
+-- 
+2.55.0
+

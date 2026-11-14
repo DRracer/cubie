@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Thu, 15 Oct 2026 19:19:03 +0200
+Subject: [PATCH] media: cedrus: print the VE version once at first
+ power-up
+
+The version register is only readable while the VE is powered, so log
+it the first time the VE is resumed.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/staging/media/sunxi/cedrus/cedrus.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+index 57a8826d8..c9944634a 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -27,6 +27,7 @@
+ #include "cedrus_enc.h"
+ #include "cedrus_engine.h"
+ #include "cedrus_proc.h"
++#include "cedrus_regs.h"
+ 
+ /* Media */
+ 
+@@ -293,6 +294,9 @@ static int cedrus_resume(struct device *dev)
+ 		goto error_clock_mod;
+ 	}
+ 
++	dev_info_once(dev, "VE version %#06lx\n",
++		      VE_VERSION_VALUE(readl(cedrus_dev->io_base + VE_VERSION)));
++
+ 	return 0;
+ 
+ error_clock_mod:
+-- 
+2.55.0
+

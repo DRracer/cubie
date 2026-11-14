@@ -1,0 +1,506 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Sat, 24 Oct 2026 19:34:47 +0200
+Subject: [PATCH] media: cedrus: separate the data direction from the
+ stateful API
+
+The driver has two nodes and infers everything from proc->role: the
+stateless decoder has the bitstream on OUTPUT and uses requests, the
+stateful encoder has it on CAPTURE and drains with LAST/EOS. A stateful
+decoder (bitstream on OUTPUT, no requests) breaks that inference.
+
+Keep role as the direction and add a stateful flag to the proc
+configuration, together with the node name and request support:
+- streaming state, drain, LAST on a CAPTURE buffer queued while
+  stopped and the EOS subscription follow the stateful flag;
+  requires_requests is set for stateless nodes only;
+- DECODER_CMD dispatches to the stateful m2m helpers on a stateful
+  decoder, the SOURCE_CHANGE event is offered there, and such a node
+  keeps G_SELECTION;
+- the watchdog names the node, and the spurious IRQ path walks all
+  nodes;
+- an engine flag, set for the H.264 encoder, asks for a VE reset after
+  an error IRQ, replacing the encoder role test.
+
+The VE reset that guarded decode jobs after encode jobs is now keyed on
+the engine instead of the role, so it also runs when two engines of one
+node alternate (e.g. H.264 and MPEG-2 decode), which share VE_MODE. The
+last engine is cleared whenever the VE was reset (watchdog, error IRQ,
+runtime resume), so the next job no longer resets a VE that was just
+reset. These two are the only changes in behaviour for the existing
+nodes.
+
+Controls are no longer mandatory for a node.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/staging/media/sunxi/cedrus/cedrus.c   | 40 +++++-----
+ drivers/staging/media/sunxi/cedrus/cedrus.h   | 13 ++-
+ .../media/sunxi/cedrus/cedrus_context.c       | 36 ++++-----
+ .../staging/media/sunxi/cedrus/cedrus_dec.c   |  2 +
+ .../staging/media/sunxi/cedrus/cedrus_enc.c   |  4 +
+ .../media/sunxi/cedrus/cedrus_enc_h264.c      |  1 +
+ .../media/sunxi/cedrus/cedrus_engine.h        |  2 +
+ .../staging/media/sunxi/cedrus/cedrus_proc.c  | 80 +++++++++++++++----
+ .../staging/media/sunxi/cedrus/cedrus_proc.h  |  8 ++
+ 9 files changed, 133 insertions(+), 53 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+index c781651c1..17bea818f 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -164,8 +164,9 @@ static void cedrus_watchdog(struct work_struct *work)
+ 		return;
+ 
+ 	v4l2_err(v4l2_dev, "frame processing timed out! (%s)\n",
+-		 ctx->proc->role == CEDRUS_ROLE_ENCODER ? "encoder" : "decoder");
++		 ctx->proc->v4l2.video_dev.name);
+ 	reset_control_reset(cedrus_dev->reset);
++	cedrus_dev->last_job_engine = NULL;
+ 
+ 	cedrus_context_job_finish(ctx, VB2_BUF_STATE_ERROR);
+ }
+@@ -179,27 +180,24 @@ static void cedrus_irq_disable_clear(struct cedrus_context *ctx)
+ 
+ static void cedrus_irq_spurious(struct cedrus_device *dev)
+ {
+-	struct cedrus_proc *proc;
++	unsigned int i;
+ 
+-	/* Disable/clear IRQ on the decoder. */
++	/* Disable/clear IRQ on every node that has an active context. */
+ 
+-	proc = &dev->dec;
+-	spin_lock(&proc->ctx_active_lock);
++	for (i = 0; i < CEDRUS_PROCS_COUNT; i++) {
++		struct cedrus_proc *proc = dev->procs[i];
+ 
+-	if (proc->ctx_active)
+-		cedrus_irq_disable_clear(proc->ctx_active);
++		/* Not set up (no engine on this variant). */
++		if (!proc->engines)
++			continue;
+ 
+-	spin_unlock(&proc->ctx_active_lock);
++		spin_lock(&proc->ctx_active_lock);
+ 
+-	/* Disable/clear IRQ on the encoder. */
++		if (proc->ctx_active)
++			cedrus_irq_disable_clear(proc->ctx_active);
+ 
+-	proc = &dev->enc;
+-	spin_lock(&proc->ctx_active_lock);
+-
+-	if (proc->ctx_active)
+-		cedrus_irq_disable_clear(proc->ctx_active);
+-
+-	spin_unlock(&proc->ctx_active_lock);
++		spin_unlock(&proc->ctx_active_lock);
++	}
+ }
+ 
+ static irqreturn_t cedrus_irq(int irq, void *private)
+@@ -240,9 +238,11 @@ static irqreturn_t cedrus_irq(int irq, void *private)
+ 
+ 	if (status == CEDRUS_IRQ_ERROR) {
+ 		state = VB2_BUF_STATE_ERROR;
+-		/* A stalled encoder may still be busy: reset like the watchdog. */
+-		if (ctx->proc->role == CEDRUS_ROLE_ENCODER)
++		/* A stalled engine may still be busy: reset like the watchdog. */
++		if (ctx->engine->reset_on_error) {
+ 			reset_control_reset(cedrus_dev->reset);
++			cedrus_dev->last_job_engine = NULL;
++		}
+ 	} else {
+ 		state = VB2_BUF_STATE_DONE;
+ 	}
+@@ -275,6 +275,7 @@ static int cedrus_resume(struct device *dev)
+ 		dev_err(dev, "failed to reset\n");
+ 		return ret;
+ 	}
++	cedrus_dev->last_job_engine = NULL;
+ 
+ 	ret = clk_prepare_enable(cedrus_dev->clock_ahb);
+ 	if (ret) {
+@@ -491,7 +492,8 @@ static int cedrus_probe(struct platform_device *platform_dev)
+ 	platform_set_drvdata(platform_dev, cedrus_dev);
+ 
+ 	INIT_DELAYED_WORK(&cedrus_dev->watchdog_work, cedrus_watchdog);
+-	cedrus_dev->last_job_role = -1;
++	cedrus_dev->procs[0] = &cedrus_dev->dec;
++	cedrus_dev->procs[1] = &cedrus_dev->enc;
+ 
+ 	ret = cedrus_resources_setup(cedrus_dev, platform_dev);
+ 	if (ret)
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+index 1b87998ba..0e69919a2 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -71,6 +71,7 @@ enum cedrus_capability {
+ };
+ 
+ struct cedrus_context;
++struct cedrus_engine;
+ 
+ /*
+  * Encoder hardware generation. The A10/A20 (VE 0x1623/0x1625) AVC encoder
+@@ -98,6 +99,9 @@ struct cedrus_format {
+ 	int		type;
+ };
+ 
++/* Video nodes (procs) of the device, see cedrus_device.procs. */
++#define CEDRUS_PROCS_COUNT	2
++
+ struct cedrus_v4l2 {
+ 	struct v4l2_device	v4l2_dev;
+ 	struct media_device	media_dev;
+@@ -110,6 +114,8 @@ struct cedrus_device {
+ 	struct cedrus_v4l2	v4l2;
+ 	struct cedrus_proc	dec;
+ 	struct cedrus_proc	enc;
++	/* All of the above, for code that handles every node alike. */
++	struct cedrus_proc	*procs[CEDRUS_PROCS_COUNT];
+ 
+ 	void __iomem		*io_base;
+ 	struct clk		*clock_ahb;
+@@ -124,8 +130,11 @@ struct cedrus_device {
+ 	struct delayed_work	watchdog_work;
+ 	u64			dma_window;
+ 
+-	/* Role of the last job (encoder/decoder), -1 after probe or reset. */
+-	int			last_job_role;
++	/*
++	 * Engine of the last job; NULL while the VE is in a known state (after
++	 * probe, runtime resume or a reset), so the next job needs no reset.
++	 */
++	const struct cedrus_engine	*last_job_engine;
+ };
+ 
+ /* Capabilities */
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_context.c b/drivers/staging/media/sunxi/cedrus/cedrus_context.c
+index 39829cabf..48e125616 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_context.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_context.c
+@@ -8,6 +8,7 @@
+  * Author: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+  */
+ 
++#include <linux/ktime.h>
+ #include <linux/reset.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/videodev2.h>
+@@ -112,9 +113,6 @@ static int cedrus_context_ctrls_setup(struct cedrus_context *ctx)
+ 	for (i = 0; i < proc->engines_count; i++)
+ 		count += proc->engines[i]->ctrl_configs_count;
+ 
+-	if (WARN_ON(!count))
+-		return -ENODEV;
+-
+ 	/* Last entry is a zero sentinel. */
+ 	size = sizeof(*v4l2->ctrls) * (count + 1);
+ 
+@@ -230,7 +228,7 @@ static void cedrus_context_streaming_update(struct cedrus_context *ctx,
+ {
+ 	struct v4l2_m2m_ctx *m2m_ctx = ctx->v4l2.fh.m2m_ctx;
+ 
+-	if (ctx->proc->role != CEDRUS_ROLE_ENCODER)
++	if (!ctx->proc->stateful)
+ 		return;
+ 
+ 	if (start) {
+@@ -256,7 +254,7 @@ void cedrus_context_job_finish(struct cedrus_context *ctx, int state)
+ 	memset(&ctx->job, 0, sizeof(ctx->job));
+ 
+ 	/* Draining: flag the output of the last source buffer and signal EOS. */
+-	if (proc->role == CEDRUS_ROLE_ENCODER) {
++	if (proc->stateful) {
+ 		struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(m2m_ctx);
+ 		struct vb2_v4l2_buffer *dst = v4l2_m2m_next_dst_buf(m2m_ctx);
+ 
+@@ -330,12 +328,19 @@ int cedrus_context_job_run(struct cedrus_context *ctx)
+ 
+ 	/*
+ 	 * Decode jobs time out on the A20 when they follow encode jobs
+-	 * (interleaved sessions): reset the VE whenever the role changes.
++	 * (interleaved sessions), and engines share state such as VE_MODE:
++	 * reset the VE whenever the engine changes. NULL means the VE is in a
++	 * known state already.
+ 	 */
+-	if (cedrus_dev->last_job_role != ctx->proc->role) {
+-		if (cedrus_dev->last_job_role >= 0)
++	if (cedrus_dev->last_job_engine != ctx->engine) {
++		if (cedrus_dev->last_job_engine) {
++			ktime_t start = ktime_get();
++
+ 			reset_control_reset(cedrus_dev->reset);
+-		cedrus_dev->last_job_role = ctx->proc->role;
++			dev_dbg(cedrus_dev->dev, "VE reset took %lld us\n",
++				ktime_us_delta(ktime_get(), start));
++		}
++		cedrus_dev->last_job_engine = ctx->engine;
+ 	}
+ 
+ 	/* Configure coded and picture formats. */
+@@ -577,7 +582,7 @@ static void cedrus_context_buffer_queue(struct vb2_buffer *vb2_buffer)
+ 		cedrus_engine_buffer_coded_queue(ctx,
+ 						 cedrus_buffer_from_vb2(vb2_buffer));
+ 
+-	if (ctx->proc->role == CEDRUS_ROLE_ENCODER &&
++	if (ctx->proc->stateful &&
+ 	    V4L2_TYPE_IS_CAPTURE(vb2_buffer->vb2_queue->type) &&
+ 	    vb2_is_streaming(vb2_buffer->vb2_queue) &&
+ 	    v4l2_m2m_dst_buf_is_last(m2m_ctx)) {
+@@ -750,19 +755,14 @@ static int cedrus_context_queue_init(void *private, struct vb2_queue *src_queue,
+ 	src_queue->ops = &cedrus_context_queue_ops;
+ 	src_queue->mem_ops = &vb2_dma_contig_memops;
+ 	src_queue->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+-	src_queue->supports_requests = true;
++	src_queue->supports_requests = proc->supports_requests;
+ 	src_queue->lock = &proc->v4l2.lock;
+ 	src_queue->dev = proc->dev->dev;
+ 	src_queue->dma_attrs = CEDRUS_HW_BUF_ATTRS;
+ 	src_queue->drv_priv = ctx;
+ 
+-	/*
+-	 * FIXME: The current encoder implementation doesn't particularly rely
+-	 * on requests, but it might become necessary for some codecs so this
+-	 * should be set dynamically later on.
+-	 */
+-	if (proc->role == CEDRUS_ROLE_DECODER)
+-		src_queue->requires_requests = true;
++	/* Stateless decoding passes every frame's parameters in a request. */
++	src_queue->requires_requests = !proc->stateful;
+ 
+ 	ret = vb2_queue_init(src_queue);
+ 	if (ret)
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+index b7edc2deb..737d49271 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+@@ -315,6 +315,8 @@ static const struct cedrus_engine *cedrus_dec_engines[] = {
+ 
+ static const struct cedrus_proc_config cedrus_dec_config = {
+ 	.role			= CEDRUS_ROLE_DECODER,
++	.name			= "dec",
++	.supports_requests	= true,
+ 
+ 	.engines		= cedrus_dec_engines,
+ 	.engines_count		= ARRAY_SIZE(cedrus_dec_engines),
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+index 8a20fd481..b80570e41 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+@@ -336,6 +336,10 @@ static const struct cedrus_engine *cedrus_enc_engines[] = {
+ 
+ static const struct cedrus_proc_config cedrus_enc_config = {
+ 	.role			= CEDRUS_ROLE_ENCODER,
++	.name			= "enc",
++	.stateful		= true,
++	/* Unused by the encoder, but advertised since 0023: keep it. */
++	.supports_requests	= true,
+ 
+ 	.engines		= cedrus_enc_engines,
+ 	.engines_count		= ARRAY_SIZE(cedrus_enc_engines),
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+index 402432eed..0018454cf 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -2145,6 +2145,7 @@ const struct cedrus_engine cedrus_enc_h264 = {
+ 	.ops			= &cedrus_enc_h264_ops,
+ 
+ 	.pixelformat		= V4L2_PIX_FMT_H264,
++	.reset_on_error		= true,
+ 	.ctrl_configs		= cedrus_enc_h264_ctrl_configs,
+ 	.ctrl_configs_count	= ARRAY_SIZE(cedrus_enc_h264_ctrl_configs),
+ 	.frmsize		= &cedrus_enc_h264_frmsize,
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_engine.h b/drivers/staging/media/sunxi/cedrus/cedrus_engine.h
+index ccd5e37bd..774a937df 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_engine.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_engine.h
+@@ -68,6 +68,8 @@ struct cedrus_engine {
+ 
+ 	u32					pixelformat;
+ 	bool					slice_based;
++	/* Reset the VE when a job of this engine ends with an error IRQ. */
++	bool					reset_on_error;
+ 
+ 	const struct v4l2_ctrl_config		*ctrl_configs;
+ 	unsigned int				ctrl_configs_count;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_proc.c b/drivers/staging/media/sunxi/cedrus/cedrus_proc.c
+index 20771f7e6..2e9752100 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_proc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_proc.c
+@@ -714,16 +714,69 @@ static int cedrus_proc_encoder_cmd(struct file *file, void *private,
+ 	return 0;
+ }
+ 
++static int cedrus_proc_decoder_cmd(struct file *file, void *private,
++				   struct v4l2_decoder_cmd *decoder_cmd)
++{
++	struct cedrus_context *ctx = cedrus_file2context(file);
++	struct v4l2_m2m_ctx *m2m_ctx = ctx->v4l2.fh.m2m_ctx;
++	bool stopped;
++	int ret;
++
++	if (!ctx->proc->stateful)
++		return v4l2_m2m_ioctl_stateless_decoder_cmd(file, private,
++							    decoder_cmd);
++
++	/* Stateful: drain like the encoder (cedrus_proc_encoder_cmd). */
++
++	stopped = v4l2_m2m_has_stopped(m2m_ctx);
++
++	ret = v4l2_m2m_ioctl_try_decoder_cmd(file, private, decoder_cmd);
++	if (ret)
++		return ret;
++
++	if (!vb2_is_streaming(v4l2_m2m_get_src_vq(m2m_ctx)))
++		return 0;
++
++	ret = v4l2_m2m_ioctl_decoder_cmd(file, private, decoder_cmd);
++	if (ret)
++		return ret;
++
++	if (decoder_cmd->cmd == V4L2_DEC_CMD_STOP &&
++	    v4l2_m2m_has_stopped(m2m_ctx))
++		cedrus_context_eos(ctx);
++
++	if (decoder_cmd->cmd == V4L2_DEC_CMD_START && stopped)
++		vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(m2m_ctx));
++
++	return 0;
++}
++
++static int cedrus_proc_try_decoder_cmd(struct file *file, void *private,
++				       struct v4l2_decoder_cmd *decoder_cmd)
++{
++	struct cedrus_context *ctx = cedrus_file2context(file);
++
++	if (!ctx->proc->stateful)
++		return v4l2_m2m_ioctl_stateless_try_decoder_cmd(file, private,
++								decoder_cmd);
++
++	return v4l2_m2m_ioctl_try_decoder_cmd(file, private, decoder_cmd);
++}
++
+ static int cedrus_proc_subscribe_event(struct v4l2_fh *fh,
+ 				       const struct v4l2_event_subscription *sub)
+ {
+ 	struct cedrus_context *ctx =
+ 		container_of(fh, struct cedrus_context, v4l2.fh);
++	struct cedrus_proc *proc = ctx->proc;
+ 
+-	if (sub->type == V4L2_EVENT_EOS &&
+-	    ctx->proc->role == CEDRUS_ROLE_ENCODER)
++	if (sub->type == V4L2_EVENT_EOS && proc->stateful)
+ 		return v4l2_event_subscribe(fh, sub, 2, NULL);
+ 
++	if (sub->type == V4L2_EVENT_SOURCE_CHANGE && proc->stateful &&
++	    proc->role == CEDRUS_ROLE_DECODER)
++		return v4l2_src_change_event_subscribe(fh, sub);
++
+ 	return v4l2_ctrl_subscribe_event(fh, sub);
+ }
+ 
+@@ -760,8 +813,8 @@ static const struct v4l2_ioctl_ops cedrus_proc_ioctl_ops = {
+ 	.vidioc_streamon		= v4l2_m2m_ioctl_streamon,
+ 	.vidioc_streamoff		= v4l2_m2m_ioctl_streamoff,
+ 
+-	.vidioc_decoder_cmd		= v4l2_m2m_ioctl_stateless_decoder_cmd,
+-	.vidioc_try_decoder_cmd		= v4l2_m2m_ioctl_stateless_try_decoder_cmd,
++	.vidioc_decoder_cmd		= cedrus_proc_decoder_cmd,
++	.vidioc_try_decoder_cmd		= cedrus_proc_try_decoder_cmd,
+ 
+ 	.vidioc_encoder_cmd		= cedrus_proc_encoder_cmd,
+ 	.vidioc_try_encoder_cmd		= v4l2_m2m_ioctl_try_encoder_cmd,
+@@ -863,7 +916,8 @@ static int cedrus_proc_v4l2_setup_entity(struct cedrus_proc *proc,
+ 	return 0;
+ }
+ 
+-static int cedrus_proc_v4l2_setup(struct cedrus_proc *proc)
++static int cedrus_proc_v4l2_setup(struct cedrus_proc *proc,
++				  const char *name)
+ {
+ 	struct cedrus_proc_v4l2 *v4l2 = &proc->v4l2;
+ 	struct v4l2_device *v4l2_dev = &proc->dev->v4l2.v4l2_dev;
+@@ -871,20 +925,14 @@ static int cedrus_proc_v4l2_setup(struct cedrus_proc *proc)
+ 	struct video_device *video_dev = &v4l2->video_dev;
+ 	struct media_link *link;
+ 	unsigned int function;
+-	const char *suffix;
+ 	int ret;
+ 
+ 	mutex_init(&v4l2->lock);
+ 
+ 	/* Video Device */
+ 
+-	if (proc->role == CEDRUS_ROLE_DECODER)
+-		suffix = "dec";
+-	else
+-		suffix = "enc";
+-
+ 	snprintf(video_dev->name, sizeof(video_dev->name), CEDRUS_NAME "-%s",
+-		 suffix);
++		 name);
+ 	video_dev->device_caps = V4L2_CAP_VIDEO_M2M | V4L2_CAP_STREAMING;
+ 	video_dev->vfl_dir = VFL_DIR_M2M;
+ 	video_dev->release = video_device_release_empty;
+@@ -897,7 +945,9 @@ static int cedrus_proc_v4l2_setup(struct cedrus_proc *proc)
+ 
+ 	if (proc->role == CEDRUS_ROLE_DECODER) {
+ 		v4l2_disable_ioctl(video_dev, VIDIOC_ENUM_FRAMEINTERVALS);
+-		v4l2_disable_ioctl(video_dev, VIDIOC_G_SELECTION);
++		/* Stateful decoders report the visible area as compose. */
++		if (!proc->stateful)
++			v4l2_disable_ioctl(video_dev, VIDIOC_G_SELECTION);
+ 		v4l2_disable_ioctl(video_dev, VIDIOC_S_SELECTION);
+ 		v4l2_disable_ioctl(video_dev, VIDIOC_G_PARM);
+ 		v4l2_disable_ioctl(video_dev, VIDIOC_S_PARM);
+@@ -1045,6 +1095,8 @@ int cedrus_proc_setup(struct cedrus_device *dev, struct cedrus_proc *proc,
+ 	proc->dev = dev;
+ 	proc->ops = ops;
+ 	proc->role = config->role;
++	proc->stateful = config->stateful;
++	proc->supports_requests = config->supports_requests;
+ 
+ 	spin_lock_init(&proc->ctx_active_lock);
+ 
+@@ -1058,7 +1110,7 @@ int cedrus_proc_setup(struct cedrus_device *dev, struct cedrus_proc *proc,
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = cedrus_proc_v4l2_setup(proc);
++	ret = cedrus_proc_v4l2_setup(proc, config->name);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_proc.h b/drivers/staging/media/sunxi/cedrus/cedrus_proc.h
+index c2aaf8b1b..00986bbca 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_proc.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_proc.h
+@@ -31,7 +31,13 @@ enum cedrus_format_type {
+ };
+ 
+ struct cedrus_proc_config {
++	/* Direction: CEDRUS_ROLE_DECODER means the bitstream is on OUTPUT. */
+ 	int				role;
++	/* Node name suffix: cedrus-<name>. */
++	const char			*name;
++	/* Stateful (drain, LAST/EOS) rather than stateless (requests) API. */
++	bool				stateful;
++	bool				supports_requests;
+ 
+ 	const struct cedrus_engine	**engines;
+ 	unsigned int			engines_count;
+@@ -73,6 +79,8 @@ struct cedrus_proc_v4l2 {
+ struct cedrus_proc {
+ 	struct cedrus_device		*dev;
+ 	int				role;
++	bool				stateful;
++	bool				supports_requests;
+ 
+ 	struct cedrus_proc_v4l2		v4l2;
+ 
+-- 
+2.55.0
+

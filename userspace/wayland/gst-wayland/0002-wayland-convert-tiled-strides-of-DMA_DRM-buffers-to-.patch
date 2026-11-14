@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Fri, 30 Oct 2026 23:28:47 +0100
+Subject: [PATCH] wayland: convert tiled strides of DMA_DRM buffers to
+ bytes
+
+With DMA_DRM caps, gst_wl_linux_dmabuf_construct_wl_buffer() takes the
+format info from the caps (GST_VIDEO_FORMAT_DMA_DRM), so get_drm_stride()
+does not see that the video meta's strides are GstVideo tile strides and
+sends them unconverted: a 1920x1080 NV12_32L32 buffer (Allwinner video
+engine, NV12 + DRM_FORMAT_MOD_ALLWINNER_TILED) gets stride 0x22003c, which
+the compositor rejects ("invalid buffer stride or height for plane 0").
+
+Use the video meta's format when it is a real format.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ wayland/gstwllinuxdmabuf.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/gst-libs/gst/wayland/gstwllinuxdmabuf.c b/gst-libs/gst/wayland/gstwllinuxdmabuf.c
+index 54c5811..b3f540e 100644
+--- a/gst-libs/gst/wayland/gstwllinuxdmabuf.c
++++ b/gst-libs/gst/wayland/gstwllinuxdmabuf.c
+@@ -125,7 +125,15 @@ gst_wl_linux_dmabuf_construct_wl_buffer (GstBuffer * buf,
+ 
+   vmeta = gst_buffer_get_video_meta (buf);
+   if (vmeta) {
+-    finfo = drm_info->vinfo.finfo;
++    /* The meta strides follow the meta's format: for a tiled format they
++     * are GstVideo tile strides, which get_drm_stride() must convert. The
++     * DMA_DRM caps format does not say whether the layout is tiled. */
++    if (vmeta->format != GST_VIDEO_FORMAT_DMA_DRM &&
++        vmeta->format != GST_VIDEO_FORMAT_UNKNOWN &&
++        vmeta->format != GST_VIDEO_FORMAT_ENCODED)
++      finfo = gst_video_format_get_info (vmeta->format);
++    else
++      finfo = drm_info->vinfo.finfo;
+     width = vmeta->width;
+     height = vmeta->height;
+     nplanes = vmeta->n_planes;
+-- 
+2.55.0
+

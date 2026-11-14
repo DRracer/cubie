@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: (GPL-2.0-or-later OR MIT)
+/dts-v1/;
+/plugin/;
+
+/*
+ * Cubietruck AP6210 Bluetooth on mainline (needs kernel patches 0006-0008
+ * and CONFIG_SERIAL_8250_16550A_VARIANTS=y, see ../README.md):
+ * - max-speed: stay at 115200 after the firmware patch; at the DT default
+ *   of 1500000 the HCI Reset after the speed change times out (-110).
+ * - local-bd-address: the firmware patch leaves 20:70:02:a0:00:00, which
+ *   hci_bcm treats as invalid and replaces with this property. The bytes
+ *   are in reverse order: [55 44 33 22 11 02] is 02:11:22:33:44:55.
+ *   EDIT IT: all zeros is ignored by the kernel and Bluetooth stays
+ *   unconfigured. Every board needs its own address (two boards with the
+ *   same address in range of each other break pairing).
+ */
+/ {
+	compatible = "allwinner,sun7i-a20";
+
+	fragment@0 {
+		target-path = "/soc/serial@1c28800/bluetooth";
+		__overlay__ {
+			max-speed = <115200>;
+			local-bd-address = [00 00 00 00 00 00];	/* EDIT ME */
+		};
+	};
+};

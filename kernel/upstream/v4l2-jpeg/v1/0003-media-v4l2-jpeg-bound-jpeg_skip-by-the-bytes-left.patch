@@ -1,0 +1,57 @@
+From 63d927a5226baf0d40d62cb4aa9fb94ab1337b0b Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Wed, 28 Oct 2026 18:42:53 +0100
+Subject: [PATCH 3/3] media: v4l2-jpeg: bound jpeg_skip() by the bytes left
+To: Mauro Carvalho Chehab <mchehab@kernel.org>
+Cc: Hans Verkuil <hverkuil@kernel.org>,
+    Philipp Zabel <p.zabel@pengutronix.de>,
+    Mirela Rabulea <mirela.rabulea@nxp.com>,
+    imx@lists.linux.dev,
+    linux-media@vger.kernel.org,
+    linux-kernel@vger.kernel.org
+
+The segment parsers compute lengths as int and pass them to
+jpeg_skip(), which takes a size_t. A negative length becomes a huge
+one, stream->curr + len wraps to a position before the current one,
+and the bounds check passes, so parsing moves backwards instead of
+failing.
+
+After the DHT and DQT fixes earlier in this series only the APP14
+parser still does that: an APP14 segment shorter than its length field
+says, or an "Adobe" one shorter than 14 bytes, is accepted, an Adobe
+one with a transform flag read from the next segment.
+
+Compare the length with the bytes left instead of computing a pointer
+past the buffer, so a negative length fails.
+
+This depends on commit "media: v4l2-jpeg: fix the end of DHT segment
+parsing": without it every DHT segment would fail here.
+
+Fixes: 50733b5b9102 ("media: add v4l2 JPEG helpers")
+Fixes: b8035f7988a8 ("media: Add parsing for APP14 data segment in jpeg helpers")
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/media/v4l2-core/v4l2-jpeg.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-jpeg.c b/drivers/media/v4l2-core/v4l2-jpeg.c
+index c2b4761b3..0258abdfb 100644
+--- a/drivers/media/v4l2-core/v4l2-jpeg.c
++++ b/drivers/media/v4l2-core/v4l2-jpeg.c
+@@ -203,7 +203,12 @@ static int jpeg_get_word_be(struct jpeg_stream *stream)
+ 
+ static int jpeg_skip(struct jpeg_stream *stream, size_t len)
+ {
+-	if (stream->curr + len > stream->end)
++	/*
++	 * Callers compute lengths as int: a negative one becomes a huge size_t
++	 * here. Compare with the bytes left, so the pointer addition can
++	 * neither wrap nor move backwards.
++	 */
++	if (len > (size_t)(stream->end - stream->curr))
+ 		return -EINVAL;
+ 
+ 	stream->curr += len;
+-- 
+2.55.0
+

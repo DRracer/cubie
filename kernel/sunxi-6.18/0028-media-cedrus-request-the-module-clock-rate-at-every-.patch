@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Thu, 15 Oct 2026 21:55:35 +0200
+Subject: [PATCH] media: cedrus: request the module clock rate at every
+ power-up
+
+On the A20 the VE module clock was 96 MHz (pll-ve / 4) after boot
+although probe requests 320 MHz (192 MHz possible from the 384 MHz
+pll-ve): the GPU retunes the shared pll-ve after the VE probed.
+Reloading the module gave 192 MHz. Decoding 1080p H.264 ran at 22
+instead of 41 fps. Request the rate again in runtime resume and print
+the resulting rate with the VE version.
+
+Tested on Cubieboard2 and Cubietruck (A20).
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/staging/media/sunxi/cedrus/cedrus.c | 16 ++++++++++++++--
+ drivers/staging/media/sunxi/cedrus/cedrus.h |  1 +
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+index c9944634a..c781651c1 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -282,6 +282,15 @@ static int cedrus_resume(struct device *dev)
+ 		goto error_reset;
+ 	}
+ 
++	/*
++	 * The rate set at probe does not survive: after boot the A20 VE ran at
++	 * 96 MHz (pll-ve / 4) instead of 192 MHz until the module was reloaded.
++	 * Request it again at every power-up.
++	 */
++	ret = clk_set_rate(cedrus_dev->clock_mod, cedrus_dev->clock_mod_rate);
++	if (ret)
++		dev_warn(dev, "failed to set module clock rate: %d\n", ret);
++
+ 	ret = clk_prepare_enable(cedrus_dev->clock_mod);
+ 	if (ret) {
+ 		dev_err(dev, "failed to enable module clock\n");
+@@ -294,8 +303,10 @@ static int cedrus_resume(struct device *dev)
+ 		goto error_clock_mod;
+ 	}
+ 
+-	dev_info_once(dev, "VE version %#06lx\n",
+-		      VE_VERSION_VALUE(readl(cedrus_dev->io_base + VE_VERSION)));
++	dev_info_once(dev, "VE version %#06lx, module clock %lu MHz\n",
++		      VE_VERSION_VALUE(readl(cedrus_dev->io_base + VE_VERSION)),
++		      clk_get_rate(cedrus_dev->clock_mod) / 1000000);
++	dev_dbg(dev, "module clock %lu Hz\n", clk_get_rate(cedrus_dev->clock_mod));
+ 
+ 	return 0;
+ 
+@@ -366,6 +377,7 @@ static int cedrus_resources_setup(struct cedrus_device *cedrus_dev,
+ 		dev_err(dev, "failed to set module clock rate\n");
+ 		return ret;
+ 	}
++	cedrus_dev->clock_mod_rate = variant->clock_mod_rate;
+ 
+ 	/* Reset */
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+index 40f33639f..a66439833 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -100,6 +100,7 @@ struct cedrus_device {
+ 	struct clk		*clock_ahb;
+ 	struct clk		*clock_mod;
+ 	struct clk		*clock_ram;
++	unsigned long		clock_mod_rate;
+ 	struct reset_control	*reset;
+ 
+ 	unsigned int		capabilities;
+-- 
+2.55.0
+

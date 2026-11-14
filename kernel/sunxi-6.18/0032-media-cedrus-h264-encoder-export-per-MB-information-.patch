@@ -1,0 +1,619 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Fri, 23 Oct 2026 12:10:19 +0200
+Subject: [PATCH] media: cedrus: h264 encoder: export per-MB information
+ as a control
+
+On P-frames the A20 VE writes one 64-bit record per macroblock: the MB
+mode and its motion vectors (integer part plus a quarter-pel remainder
+per 8x8 quadrant). Motion detection can use them instead of analysing
+the pictures on the CPU.
+
+Export them through a read-only U32 array control that, like
+V4L2_CID_MPEG_VIDEO_AVERAGE_QP, applies to the last dequeued CAPTURE
+buffer: a header (magic/version, valid flag, buffer sequence, MB grid)
+followed by the records in raster order. A boolean control enables the
+copy, which costs nothing when off.
+
+Jobs complete ahead of the dequeue and the next job overwrites the MV
+buffer, so job_finish copies the records into a per-CAPTURE-buffer image
+and buf_finish publishes that image when the buffer is dequeued. The
+images are sized from the picture format at buffer allocation: the
+encoder refuses format changes while buffers are allocated, and
+job_finish checks the capacity anyway.
+
+The array follows the picture format (at open, on S_FMT) and is cleared
+at every stream start, so a header from a previous session, whose
+sequence numbers restarted at 0, cannot match a new buffer.
+
+The control IDs come from a new range, V4L2_CID_USER_CEDRUS_BASE; the
+layout is documented in uapi/cedrus-enc.h.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/sunxi/cedrus/cedrus_context.c       |  27 +++
+ .../media/sunxi/cedrus/cedrus_context.h       |   1 +
+ .../media/sunxi/cedrus/cedrus_enc_h264.c      | 195 ++++++++++++++++++
+ .../media/sunxi/cedrus/cedrus_enc_h264.h      |  14 ++
+ .../media/sunxi/cedrus/cedrus_engine.c        |  63 ++++++
+ .../media/sunxi/cedrus/cedrus_engine.h        |  25 +++
+ .../staging/media/sunxi/cedrus/cedrus_proc.c  |   2 +
+ .../media/sunxi/cedrus/uapi/cedrus-enc.h      |  59 ++++++
+ include/uapi/linux/v4l2-controls.h            |   7 +
+ 9 files changed, 393 insertions(+)
+ create mode 100644 drivers/staging/media/sunxi/cedrus/uapi/cedrus-enc.h
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_context.c b/drivers/staging/media/sunxi/cedrus/cedrus_context.c
+index aad81ec4a..39829cabf 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_context.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_context.c
+@@ -483,6 +483,9 @@ static int cedrus_context_buffer_init(struct vb2_buffer *vb2_buffer)
+ 		cedrus_proc_format_type(ctx->proc, vb2_buffer->type);
+ 	int ret;
+ 
++	if (format_type == CEDRUS_FORMAT_TYPE_CODED)
++		return cedrus_engine_buffer_coded_setup(ctx, cedrus_buffer);
++
+ 	if (!engine->buffer_size)
+ 		return 0;
+ 
+@@ -515,6 +518,11 @@ static void cedrus_context_buffer_cleanup(struct vb2_buffer *vb2_buffer)
+ 	unsigned int format_type =
+ 		cedrus_proc_format_type(ctx->proc, vb2_buffer->type);
+ 
++	if (format_type == CEDRUS_FORMAT_TYPE_CODED) {
++		cedrus_engine_buffer_coded_cleanup(ctx, cedrus_buffer);
++		return;
++	}
++
+ 	if (format_type == CEDRUS_FORMAT_TYPE_PICTURE &&
+ 	    cedrus_buffer->engine_buffer) {
+ 		cedrus_engine_buffer_cleanup(ctx, cedrus_buffer);
+@@ -564,6 +572,11 @@ static void cedrus_context_buffer_queue(struct vb2_buffer *vb2_buffer)
+ 	struct vb2_v4l2_buffer *v4l2_buffer = to_vb2_v4l2_buffer(vb2_buffer);
+ 	struct v4l2_m2m_ctx *m2m_ctx = ctx->v4l2.fh.m2m_ctx;
+ 
++	if (cedrus_proc_format_type(ctx->proc, vb2_buffer->type) ==
++	    CEDRUS_FORMAT_TYPE_CODED)
++		cedrus_engine_buffer_coded_queue(ctx,
++						 cedrus_buffer_from_vb2(vb2_buffer));
++
+ 	if (ctx->proc->role == CEDRUS_ROLE_ENCODER &&
+ 	    V4L2_TYPE_IS_CAPTURE(vb2_buffer->vb2_queue->type) &&
+ 	    vb2_is_streaming(vb2_buffer->vb2_queue) &&
+@@ -577,6 +590,16 @@ static void cedrus_context_buffer_queue(struct vb2_buffer *vb2_buffer)
+ 	v4l2_m2m_buf_queue(m2m_ctx, v4l2_buffer);
+ }
+ 
++static void cedrus_context_buffer_finish(struct vb2_buffer *vb2_buffer)
++{
++	struct cedrus_context *ctx = vb2_get_drv_priv(vb2_buffer->vb2_queue);
++
++	if (cedrus_proc_format_type(ctx->proc, vb2_buffer->type) ==
++	    CEDRUS_FORMAT_TYPE_CODED)
++		cedrus_engine_buffer_coded_finish(ctx,
++						  cedrus_buffer_from_vb2(vb2_buffer));
++}
++
+ static int cedrus_context_buffer_validate(struct vb2_buffer *vb2_buffer)
+ {
+ 	struct vb2_v4l2_buffer *v4l2_buffer = to_vb2_v4l2_buffer(vb2_buffer);
+@@ -705,6 +728,7 @@ static const struct vb2_ops cedrus_context_queue_ops = {
+ 	.buf_cleanup		= cedrus_context_buffer_cleanup,
+ 	.buf_prepare		= cedrus_context_buffer_prepare,
+ 	.buf_queue		= cedrus_context_buffer_queue,
++	.buf_finish		= cedrus_context_buffer_finish,
+ 	.buf_out_validate	= cedrus_context_buffer_validate,
+ 	.buf_request_complete	= cedrus_context_buffer_complete,
+ 	.start_streaming	= cedrus_context_start_streaming,
+@@ -801,6 +825,9 @@ int cedrus_context_setup(struct cedrus_proc *proc, struct cedrus_context *ctx,
+ 	if (ret)
+ 		goto error_ctrls;
+ 
++	/* Controls that follow the picture format (default format). */
++	cedrus_engine_format_picture_update(ctx);
++
+ 	/* V4L2 File Handler */
+ 
+ 	v4l2_fh_add(fh, file);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_context.h b/drivers/staging/media/sunxi/cedrus/cedrus_context.h
+index ae7f30f4f..4cf78b2cd 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_context.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_context.h
+@@ -30,6 +30,7 @@ struct cedrus_job {
+ 
+ struct cedrus_buffer {
+ 	struct v4l2_m2m_buffer	m2m_buffer;
++	/* Engine data of picture or coded buffers, depending on the queue. */
+ 	void			*engine_buffer;
+ };
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+index ec9eac5a0..402432eed 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -22,6 +22,7 @@
+ #include "cedrus_engine.h"
+ #include "cedrus_proc.h"
+ #include "cedrus_regs.h"
++#include "uapi/cedrus-enc.h"
+ 
+ static int rc_i_qp_offset = 2;
+ module_param(rc_i_qp_offset, int, 0644);
+@@ -522,6 +523,159 @@ static int cedrus_enc_h264_ctrl_prepare(struct cedrus_context *cedrus_ctx,
+ 	return 0;
+ }
+ 
++/*
++ * MB information control (V4L2_CID_CEDRUS_ENC_MB_INFO): the VE motion vector
++ * records, unrelated to the hardware MB info buffer (mb_info below).
++ */
++
++static unsigned int cedrus_enc_h264_mb_info_elems(struct cedrus_context *ctx)
++{
++	struct v4l2_pix_format *pix_format = &ctx->v4l2.format_picture.fmt.pix;
++
++	return CEDRUS_ENC_MB_INFO_ELEMS(DIV_ROUND_UP(pix_format->width, 16),
++					DIV_ROUND_UP(pix_format->height, 16));
++}
++
++/*
++ * Size the array to the MB grid of the picture format. v4l2_ctrl_modify_dimensions
++ * also clears it: forced at stream start, so a header of the previous session
++ * (sequence numbers restart at 0) cannot match a new buffer.
++ */
++static int cedrus_enc_h264_mb_info_resize(struct cedrus_context *ctx, bool clear)
++{
++	struct v4l2_ctrl *ctrl =
++		cedrus_context_ctrl_find(ctx, V4L2_CID_CEDRUS_ENC_MB_INFO);
++	u32 dims[V4L2_CTRL_MAX_DIMS] = { cedrus_enc_h264_mb_info_elems(ctx) };
++
++	if (!ctrl || (!clear && ctrl->elems == dims[0]))
++		return 0;
++
++	return v4l2_ctrl_modify_dimensions(ctrl, dims);
++}
++
++static void cedrus_enc_h264_format_picture_update(struct cedrus_context *ctx)
++{
++	if (cedrus_enc_h264_mb_info_resize(ctx, false))
++		dev_warn(ctx->proc->dev->dev, "failed to resize the MB info control\n");
++}
++
++static int cedrus_enc_h264_buffer_coded_setup(struct cedrus_context *ctx,
++					      struct cedrus_buffer *buffer)
++{
++	struct cedrus_enc_h264_coded_buffer *coded;
++	unsigned int elems = cedrus_enc_h264_mb_info_elems(ctx);
++
++	/*
++	 * Sized for the current format: the encoder refuses format changes
++	 * while buffers are allocated, and job_finish checks the capacity.
++	 */
++	coded = kvzalloc(struct_size(coded, image, elems), GFP_KERNEL);
++	if (!coded)
++		return -ENOMEM;
++
++	coded->capacity = elems;
++	buffer->engine_buffer = coded;
++
++	return 0;
++}
++
++static void cedrus_enc_h264_buffer_coded_cleanup(struct cedrus_context *ctx,
++						 struct cedrus_buffer *buffer)
++{
++	kvfree(buffer->engine_buffer);
++	buffer->engine_buffer = NULL;
++}
++
++static void cedrus_enc_h264_buffer_coded_queue(struct cedrus_context *ctx,
++					       struct cedrus_buffer *buffer)
++{
++	struct cedrus_enc_h264_coded_buffer *coded = buffer->engine_buffer;
++
++	if (coded)
++		coded->filled = false;
++}
++
++/*
++ * Runs from vb2 buf_finish: at VIDIOC_DQBUF, but also when the queue is
++ * cancelled, after stop_streaming freed the engine context. Only the buffer
++ * and the context's controls are used.
++ */
++static void cedrus_enc_h264_buffer_coded_finish(struct cedrus_context *ctx,
++						struct cedrus_buffer *buffer)
++{
++	struct cedrus_enc_h264_coded_buffer *coded = buffer->engine_buffer;
++	struct vb2_buffer *vb2_buffer = &buffer->m2m_buffer.vb.vb2_buf;
++	struct v4l2_ctrl *ctrl;
++	unsigned int mb_w, mb_h;
++
++	if (!coded || !coded->filled)
++		return;
++
++	coded->filled = false;
++
++	/* Nobody reads it after STREAMOFF or at close. */
++	if (vb2_buffer->state != VB2_BUF_STATE_DONE ||
++	    !vb2_is_streaming(vb2_buffer->vb2_queue))
++		return;
++
++	ctrl = cedrus_context_ctrl_find(ctx, V4L2_CID_CEDRUS_ENC_MB_INFO);
++	if (!ctrl)
++		return;
++
++	mb_w = coded->image[2] & 0xffff;
++	mb_h = coded->image[2] >> 16;
++
++	/* The core copies ctrl->elems elements: the image must match. */
++	v4l2_ctrl_lock(ctrl);
++	if (ctrl->elems == CEDRUS_ENC_MB_INFO_ELEMS(mb_w, mb_h))
++		__v4l2_ctrl_s_ctrl_compound(ctrl, V4L2_CTRL_TYPE_U32,
++					    coded->image);
++	v4l2_ctrl_unlock(ctrl);
++}
++
++/*
++ * Called from job_finish (IRQ context), before the next job overwrites the
++ * MV buffer: fill the image of the coded buffer. The VE writes the records
++ * of P-frames only, rows of ALIGN(mb_w, 4) MBs.
++ */
++static void cedrus_enc_h264_mb_info_fill(struct cedrus_context *ctx, int state)
++{
++	struct cedrus_enc_h264_context *h264_ctx = ctx->engine_ctx;
++	struct cedrus_enc_h264_job *job = ctx->engine_job;
++	struct vb2_v4l2_buffer *v4l2_buffer = ctx->job.buffer_coded;
++	struct cedrus_enc_h264_coded_buffer *coded =
++		cedrus_job_buffer_coded(ctx)->engine_buffer;
++	unsigned int mb_w = h264_ctx->width_mbs;
++	unsigned int mb_h = h264_ctx->height_mbs;
++	unsigned int stride = ALIGN(mb_w, 4) * 8;
++	unsigned int row;
++	bool valid;
++
++	if (!coded || !h264_ctx->mb_info_enable ||
++	    !READ_ONCE(h264_ctx->mb_info_enable->cur.val))
++		return;
++
++	if (WARN_ON_ONCE(CEDRUS_ENC_MB_INFO_ELEMS(mb_w, mb_h) > coded->capacity))
++		return;
++
++	valid = state == VB2_BUF_STATE_DONE && h264_ctx->mv &&
++		job->frame_type == CEDRUS_ENC_H264_FRAME_TYPE_P;
++
++	coded->image[0] = CEDRUS_ENC_MB_INFO_MAGIC | CEDRUS_ENC_MB_INFO_VERSION |
++			  (valid ? CEDRUS_ENC_MB_INFO_FLAG_VALID : 0);
++	coded->image[1] = v4l2_buffer->sequence;
++	coded->image[2] = mb_w | mb_h << 16;
++	coded->image[3] = 0;
++
++	if (valid)
++		for (row = 0; row < mb_h; row++)
++			memcpy(&coded->image[CEDRUS_ENC_MB_INFO_HDR_ELEMS +
++					     row * mb_w * 2],
++			       h264_ctx->mv + row * stride, mb_w * 8);
++
++	coded->filled = true;
++}
++
+ /* Context */
+ 
+ static void cedrus_enc_h264_ref_free(struct device *dev,
+@@ -623,6 +777,12 @@ static int cedrus_enc_h264_setup(struct cedrus_context *cedrus_ctx)
+ 	h264_ctx->deblk = NULL;
+ 	h264_ctx->mv = NULL;
+ 	h264_ctx->sequence = 0;
++	h264_ctx->mb_info_enable =
++		cedrus_context_ctrl_find(cedrus_ctx,
++					 V4L2_CID_CEDRUS_ENC_MB_INFO_ENABLE);
++	ret = cedrus_enc_h264_mb_info_resize(cedrus_ctx, true);
++	if (ret)
++		return ret;
+ 	memset(h264_ctx->refs, 0, sizeof(h264_ctx->refs));
+ 
+ 	/* Macroblock Information Buffer */
+@@ -1608,6 +1768,8 @@ static int cedrus_enc_h264_job_finish(struct cedrus_context *ctx, int state)
+ 	ctx->job.buffer_picture->sequence = h264_ctx->sequence;
+ 	v4l2_buffer->sequence = h264_ctx->sequence++;
+ 
++	cedrus_enc_h264_mb_info_fill(ctx, state);
++
+ 	if (state != VB2_BUF_STATE_DONE) {
+ 		/*
+ 		 * The reconstruction of this job is unusable and the decoder
+@@ -1700,6 +1862,13 @@ static const struct cedrus_engine_ops cedrus_enc_h264_ops = {
+ 	.job_trigger		= cedrus_enc_h264_job_trigger,
+ 	.job_finish		= cedrus_enc_h264_job_finish,
+ 
++	.buffer_coded_setup	= cedrus_enc_h264_buffer_coded_setup,
++	.buffer_coded_cleanup	= cedrus_enc_h264_buffer_coded_cleanup,
++	.buffer_coded_queue	= cedrus_enc_h264_buffer_coded_queue,
++	.buffer_coded_finish	= cedrus_enc_h264_buffer_coded_finish,
++
++	.format_picture_update	= cedrus_enc_h264_format_picture_update,
++
+ 	.irq_status		= cedrus_enc_h264_irq_status,
+ 	.irq_clear		= cedrus_enc_h264_irq_clear,
+ 	.irq_disable		= cedrus_enc_h264_irq_disable,
+@@ -1930,6 +2099,32 @@ static const struct v4l2_ctrl_config cedrus_enc_h264_ctrl_configs[] = {
+ 		.id		= V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME,
+ 		.ops		= &cedrus_context_ctrl_ops,
+ 	},
++
++	/*
++	 * MB information. No ops: the driver sets MB_INFO itself, and the
++	 * engine's validate/prepare must not see it.
++	 */
++	{
++		.id		= V4L2_CID_CEDRUS_ENC_MB_INFO_ENABLE,
++		.name		= "MB Information Enable",
++		.type		= V4L2_CTRL_TYPE_BOOLEAN,
++		.min		= 0,
++		.max		= 1,
++		.step		= 1,
++		.def		= 0,
++	},
++	{
++		.id		= V4L2_CID_CEDRUS_ENC_MB_INFO,
++		.name		= "MB Information",
++		.type		= V4L2_CTRL_TYPE_U32,
++		.flags		= V4L2_CTRL_FLAG_READ_ONLY,
++		.min		= 0,
++		.max		= U32_MAX,
++		.step		= 1,
++		.def		= 0,
++		/* Resized to the MB grid by format_picture_update. */
++		.dims		= { CEDRUS_ENC_MB_INFO_ELEMS(1, 1) },
++	},
+ };
+ 
+ static const struct v4l2_frmsize_stepwise cedrus_enc_h264_frmsize = {
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
+index f0ebdb062..0d30b8221 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
+@@ -119,6 +119,9 @@ struct cedrus_enc_h264_context {
+ 	 */
+ 	u32				sequence;
+ 
++	/* V4L2_CID_CEDRUS_ENC_MB_INFO_ENABLE, read in job_finish. */
++	struct v4l2_ctrl		*mb_info_enable;
++
+ 	/*
+ 	 * Two slots: one is reconstructed by the current job, the other holds
+ 	 * the reference. The roles swap only after a successful encode, so a
+@@ -182,6 +185,17 @@ struct cedrus_enc_h264_context {
+ };
+ 
+ 
++/*
++ * Per coded (CAPTURE) buffer: the V4L2_CID_CEDRUS_ENC_MB_INFO image of the
++ * frame encoded into it, filled in job_finish and published to the control
++ * when the buffer is dequeued.
++ */
++struct cedrus_enc_h264_coded_buffer {
++	bool		filled;
++	unsigned int	capacity;
++	u32		image[];
++};
++
+ extern const struct cedrus_engine cedrus_enc_h264;
+ 
+ static inline u8 cedrus_enc_h264_nalu_header(u8 type, u8 ref_idc)
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_engine.c b/drivers/staging/media/sunxi/cedrus/cedrus_engine.c
+index a2591597d..54296d9ee 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_engine.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_engine.c
+@@ -147,6 +147,69 @@ void cedrus_engine_buffer_cleanup(struct cedrus_context *ctx,
+ 	engine->ops->buffer_cleanup(ctx, buffer);
+ }
+ 
++int cedrus_engine_buffer_coded_setup(struct cedrus_context *ctx,
++				     struct cedrus_buffer *buffer)
++{
++	const struct cedrus_engine *engine = ctx->engine;
++
++	if (WARN_ON(!engine || !engine->ops))
++		return -ENODEV;
++
++	if (!engine->ops->buffer_coded_setup)
++		return 0;
++
++	return engine->ops->buffer_coded_setup(ctx, buffer);
++}
++
++void cedrus_engine_buffer_coded_cleanup(struct cedrus_context *ctx,
++					struct cedrus_buffer *buffer)
++{
++	const struct cedrus_engine *engine = ctx->engine;
++
++	if (WARN_ON(!engine || !engine->ops) ||
++	    !engine->ops->buffer_coded_cleanup)
++		return;
++
++	engine->ops->buffer_coded_cleanup(ctx, buffer);
++}
++
++void cedrus_engine_buffer_coded_queue(struct cedrus_context *ctx,
++				      struct cedrus_buffer *buffer)
++{
++	const struct cedrus_engine *engine = ctx->engine;
++
++	if (WARN_ON(!engine || !engine->ops) ||
++	    !engine->ops->buffer_coded_queue)
++		return;
++
++	engine->ops->buffer_coded_queue(ctx, buffer);
++}
++
++void cedrus_engine_buffer_coded_finish(struct cedrus_context *ctx,
++				       struct cedrus_buffer *buffer)
++{
++	const struct cedrus_engine *engine = ctx->engine;
++
++	if (WARN_ON(!engine || !engine->ops) ||
++	    !engine->ops->buffer_coded_finish)
++		return;
++
++	engine->ops->buffer_coded_finish(ctx, buffer);
++}
++
++/* Format */
++
++void cedrus_engine_format_picture_update(struct cedrus_context *ctx)
++{
++	const struct cedrus_engine *engine = ctx->engine;
++
++	if (WARN_ON(!engine || !engine->ops) ||
++	    !engine->ops->format_picture_update)
++		return;
++
++	engine->ops->format_picture_update(ctx);
++}
++
+ /* Job */
+ 
+ int cedrus_engine_job_prepare(struct cedrus_context *ctx)
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_engine.h b/drivers/staging/media/sunxi/cedrus/cedrus_engine.h
+index f5d21549a..ccd5e37bd 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_engine.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_engine.h
+@@ -32,6 +32,22 @@ struct cedrus_engine_ops {
+ 	void (*buffer_cleanup)(struct cedrus_context *ctx,
+ 			       struct cedrus_buffer *buffer);
+ 
++	/*
++	 * Coded buffers. buffer_coded_finish runs from vb2 buf_finish, also
++	 * after stop_streaming freed the engine context: it must only use the
++	 * buffer and the context's controls.
++	 */
++	int (*buffer_coded_setup)(struct cedrus_context *ctx,
++				  struct cedrus_buffer *buffer);
++	void (*buffer_coded_cleanup)(struct cedrus_context *ctx,
++				     struct cedrus_buffer *buffer);
++	void (*buffer_coded_queue)(struct cedrus_context *ctx,
++				   struct cedrus_buffer *buffer);
++	void (*buffer_coded_finish)(struct cedrus_context *ctx,
++				    struct cedrus_buffer *buffer);
++
++	void (*format_picture_update)(struct cedrus_context *ctx);
++
+ 	int (*job_prepare)(struct cedrus_context *ctx);
+ 	int (*job_configure)(struct cedrus_context *ctx);
+ 	void (*job_trigger)(struct cedrus_context *ctx);
+@@ -93,6 +109,15 @@ int cedrus_engine_buffer_setup(struct cedrus_context *ctx,
+ 			       struct cedrus_buffer *buffer);
+ void cedrus_engine_buffer_cleanup(struct cedrus_context *ctx,
+ 				  struct cedrus_buffer *buffer);
++int cedrus_engine_buffer_coded_setup(struct cedrus_context *ctx,
++				     struct cedrus_buffer *buffer);
++void cedrus_engine_buffer_coded_cleanup(struct cedrus_context *ctx,
++					struct cedrus_buffer *buffer);
++void cedrus_engine_buffer_coded_queue(struct cedrus_context *ctx,
++				      struct cedrus_buffer *buffer);
++void cedrus_engine_buffer_coded_finish(struct cedrus_context *ctx,
++				       struct cedrus_buffer *buffer);
++void cedrus_engine_format_picture_update(struct cedrus_context *ctx);
+ 
+ /* Job */
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_proc.c b/drivers/staging/media/sunxi/cedrus/cedrus_proc.c
+index d77804b19..20771f7e6 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_proc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_proc.c
+@@ -458,6 +458,8 @@ static int cedrus_proc_s_fmt(struct file *file, void *private,
+ 		ret = cedrus_context_engine_update(ctx);
+ 		if (ret)
+ 			return ret;
++	} else {
++		cedrus_engine_format_picture_update(ctx);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/staging/media/sunxi/cedrus/uapi/cedrus-enc.h b/drivers/staging/media/sunxi/cedrus/uapi/cedrus-enc.h
+new file mode 100644
+index 000000000..4ca75e7e4
+--- /dev/null
++++ b/drivers/staging/media/sunxi/cedrus/uapi/cedrus-enc.h
+@@ -0,0 +1,59 @@
++/* SPDX-License-Identifier: ((GPL-2.0+ WITH Linux-syscall-note) OR MIT) */
++/*
++ * Cedrus Video Engine Driver: encoder controls
++ *
++ * Per-macroblock information of the last dequeued coded (CAPTURE) buffer,
++ * as written by the A20 VE for P-frames: the MB mode and the motion vectors.
++ */
++
++#ifndef _UAPI_CEDRUS_ENC_H_
++#define _UAPI_CEDRUS_ENC_H_
++
++#include <linux/types.h>
++#include <linux/v4l2-controls.h>
++
++/* Out-of-tree module builds may use headers without the reservation. */
++#ifndef V4L2_CID_USER_CEDRUS_BASE
++#define V4L2_CID_USER_CEDRUS_BASE		(V4L2_CID_USER_BASE + 0x1230)
++#endif
++
++/* Copy the MB information of every encoded frame (boolean, default 0). */
++#define V4L2_CID_CEDRUS_ENC_MB_INFO_ENABLE	(V4L2_CID_USER_CEDRUS_BASE + 0)
++
++/*
++ * MB information of the last dequeued CAPTURE buffer (read-only U32 array).
++ * Read it after each VIDIOC_DQBUF on the CAPTURE queue: the next dequeue
++ * replaces it. The array has CEDRUS_ENC_MB_INFO_ELEMS(mb_w, mb_h) elements
++ * for the current picture format; the dimensions change with the format.
++ *
++ * [0]  CEDRUS_ENC_MB_INFO_MAGIC | CEDRUS_ENC_MB_INFO_VERSION | flags
++ * [1]  sequence of the CAPTURE buffer the data belongs to
++ * [2]  mb_w | mb_h << 16
++ * [3]  reserved, 0
++ * [4]  records: mb_h rows of mb_w MBs, each MB a little-endian 64-bit
++ *      record stored as two U32 (low word first), raster order.
++ *      Valid only if CEDRUS_ENC_MB_INFO_FLAG_VALID is set (P-frames).
++ *
++ * Record bits:
++ *   57..55  MB mode: 0 P16x16, 1 P16x8, 2 P8x16, 3 P8x8, 4 I4x4, 5 I16x16,
++ *           7 P_Skip (the vectors hold the predicted skip vector)
++ *   54..47  signed integer-pel MV x
++ *   46..40  signed integer-pel MV y
++ *   39..0   four signed 5-bit quarter-pel remainder pairs (x, y), one per
++ *           8x8 quadrant in raster order, from bit 39 down:
++ *           mv_qpel[q] = 4 * integer + remainder[q]
++ *   63..58  0
++ */
++#define V4L2_CID_CEDRUS_ENC_MB_INFO		(V4L2_CID_USER_CEDRUS_BASE + 1)
++
++#define CEDRUS_ENC_MB_INFO_MAGIC		(0xceU << 24)
++#define CEDRUS_ENC_MB_INFO_MAGIC_MASK		(0xffU << 24)
++#define CEDRUS_ENC_MB_INFO_VERSION		(1U << 16)
++#define CEDRUS_ENC_MB_INFO_VERSION_MASK		(0xffU << 16)
++#define CEDRUS_ENC_MB_INFO_FLAG_VALID		(1U << 0)
++
++#define CEDRUS_ENC_MB_INFO_HDR_ELEMS		4
++#define CEDRUS_ENC_MB_INFO_ELEMS(mb_w, mb_h) \
++	(CEDRUS_ENC_MB_INFO_HDR_ELEMS + 2 * (mb_w) * (mb_h))
++
++#endif
+diff --git a/include/uapi/linux/v4l2-controls.h b/include/uapi/linux/v4l2-controls.h
+index 2d30107e0..8c18c0ef7 100644
+--- a/include/uapi/linux/v4l2-controls.h
++++ b/include/uapi/linux/v4l2-controls.h
+@@ -228,6 +228,13 @@ enum v4l2_colorfx {
+  */
+ #define V4L2_CID_USER_RKISP1_BASE		(V4L2_CID_USER_BASE + 0x1220)
+ 
++/*
++ * The base for the cedrus driver controls.
++ * See drivers/staging/media/sunxi/cedrus/uapi/cedrus-enc.h for the list of
++ * controls. We reserve 16 controls for this driver.
++ */
++#define V4L2_CID_USER_CEDRUS_BASE		(V4L2_CID_USER_BASE + 0x1230)
++
+ /* MPEG-class control IDs */
+ /* The MPEG controls are applicable to all codec controls
+  * and the 'MPEG' part of the define is historical */
+-- 
+2.55.0
+

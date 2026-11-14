@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 D.R.racer
+# Cubietruck AP6210 Bluetooth bring-up, gated on the A20 32 kHz crystal.
+# The BT controller samples its low-power clock (LOSC via CLK_OUT_A) at power-up only (< 0.1 s): powered up while
+# LOSC runs on the internal RC (crystal stopped, LOSC_CTRL bit 13 set), its radio stays deaf until the next power-up,
+# even after the crystal comes back. The chip gets power only when hci_uart_bcm binds (bcm_open -> BT_REG_ON at
+# serdev probe; bcm_close at unbind); bluetoothd restarts, rfkill and "power off/on" do not power-cycle it, suspend
+# only toggles BT_WAKE. So the bind is the one moment to guard. The crystal stops by itself now and then (often
+# under load), so:
+#  1. load hci_uart (blacklisted for udev) only after the crystal has run cleanly for GOOD_S seconds; give up waiting
+#     after GATE_S and power up anyway (scanning/pairing does not work; paired devices may still reconnect, unverified);
+#  2. watch bit 13 through the power-up; re-bind if the hci_uart_bcm setup failed (no BD address; UART timing);
+#  3. if the power-up was not clean, keep watching and re-bind once the crystal is good and no BT device is
+#     connected (a re-bind drops connections).
+# "cubietruck-bt rebind" re-binds on a good crystal right away, e.g. before pairing.
+# Background: README.md next to this script
+import fcntl, mmap, os, struct, subprocess, sys, threading, time
+
+DRV = "/sys/bus/serial/drivers/hci_uart_bcm"
+DEV = "serial0-0"
+GOOD_S, GATE_S, WATCH_S, TRIES, READY_S = 10, 120, 3, 5, 25
+
+fd = os.open("/dev/mem", os.O_RDONLY | os.O_SYNC)
+m = mmap.mmap(fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ, offset=0x01c20000)
+losc = lambda: struct.unpack_from("<I", m, 0xd00)[0]
+hms = lambda: struct.unpack_from("<I", m, 0xd08)[0]
+
+def log(msg, warn=False):
+    """to the journal; "<4>" makes it a syslog warning (SyslogLevelPrefix)"""
+    print(("<4>" if warn else "") + msg, flush=True)
+
+def sh(cmd, t=30):
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=t).stdout
+    except subprocess.TimeoutExpired:
+        return ""
+
+def crystal_good(seconds=GOOD_S):
+    """bit 13 clear and the RTC second within 0.5 % of 1 s for the whole window (slope error with >= 8 edges at
+    10 ms polling ~0.15 %; the RC runs ~3.4 % slow)"""
+    edges, h0, end = [], hms(), time.monotonic() + seconds
+    while time.monotonic() < end:
+        v = losc()
+        if v & 0x2000 or not v & 1:
+            return False
+        h = hms()
+        if h != h0:
+            edges.append(time.monotonic())
+            h0 = h
+        time.sleep(0.01)
+    if len(edges) < seconds - 2:
+        return False
+    sec = (edges[-1] - edges[0]) / (len(edges) - 1)
+    return 0.995 < sec < 1.005
+
+def second():
+    """the RTC second measured over 4 edges, for the log"""
+    e, h0, end = [], hms(), time.monotonic() + 5
+    while len(e) < 4 and time.monotonic() < end:
+        h = hms()
+        if h != h0:
+            e.append(time.monotonic())
+            h0 = h
+        time.sleep(0.01)
+    return (e[-1] - e[0]) / (len(e) - 1) if len(e) > 1 else 0.0
+
+def wait_crystal(limit):
+    end = time.monotonic() + limit
+    while time.monotonic() < end:
+        if crystal_good():
+            return True
+    return False
+
+def ready():
+    """hci0 set up (has a BD address); "not yet" if hciconfig hangs, or if it is missing and hci0 exists"""
+    if not HCICONFIG:
+        return os.path.exists("/sys/class/bluetooth/hci0")
+    out = sh("hciconfig hci0")
+    return "BD Address:" in out and "BD Address: 00:00:00:00:00:00" not in out
+
+def sysfs(name):
+    try:
+        with open(f"{DRV}/{name}", "w") as f:
+            f.write(DEV)
+        return True
+    except OSError as e:
+        log(f"{name} {DEV}: {e}")
+        return False
+
+def power_up():
+    """(re)start the controller; True if the crystal stayed good through the power-up. BT_REG_ON happens inside
+    the modprobe/bind call, so bit 13 is watched from just before the call until WATCH_S after it."""
+    if os.path.exists(f"{DRV}/{DEV}"):
+        sysfs("unbind")
+        time.sleep(1)
+    v0 = losc()
+    bad, stop = [], threading.Event()
+
+    def watch():
+        while not stop.is_set():
+            if losc() & 0x2000:
+                bad.append(1)
+            time.sleep(0.01)
+    w = threading.Thread(target=watch)
+    w.start()
+    t0 = time.monotonic()
+    ok = True
+    if not os.path.exists(DRV):
+        r = subprocess.run(["modprobe", "hci_uart"], capture_output=True, text=True)
+        if r.returncode:
+            log(f"modprobe hci_uart failed: {r.stderr.strip()}")
+            ok = False
+    else:
+        ok = sysfs("bind")
+    dt = time.monotonic() - t0
+    time.sleep(WATCH_S)
+    stop.set()
+    w.join()
+    clean = ok and not bad and not v0 & 0x2000
+    log(f"power-up: call {dt:.2f} s, LOSC {v0:08x}, second {second():.4f}, "
+        f"{'clean' if clean else 'NOT clean (crystal failed over during the power-up)'}")
+    return clean
+
+def wait_ready():
+    end = time.monotonic() + READY_S
+    while time.monotonic() < end:
+        if ready():
+            return True
+        time.sleep(0.5)
+    return False
+
+def bring_up(gate_s):
+    good = wait_crystal(gate_s)
+    if good:
+        log("crystal good, powering up")
+    else:
+        log(f"32 kHz crystal not running after {gate_s} s (board too hot?), powering up anyway", warn=True)
+    clean = power_up() and good
+    for n in range(1, TRIES + 1):
+        if wait_ready():
+            break
+        log(f"hci0 setup failed, re-bind {n}/{TRIES}")
+        good = wait_crystal(30)
+        clean = power_up() and good
+    else:
+        if not wait_ready():
+            log(f"hci0 still down after {TRIES} re-binds")
+            return None
+    if clean:
+        log("hci0 up")
+    else:
+        log("hci0 up, but the 32 kHz crystal was not running at power-up: Bluetooth cannot scan or pair. "
+            "Let the board cool down; Bluetooth is re-initialised automatically once the crystal runs and "
+            "no device is connected (or run: cubietruck-bt rebind)", warn=True)
+    return clean
+
+def connected():
+    """True/False, or None if bluetoothctl failed or hung (then a re-bind must not happen)"""
+    try:
+        r = subprocess.run(["bluetoothctl", "devices", "Connected"], capture_output=True, text=True, timeout=15,
+                           stdin=subprocess.DEVNULL)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return None if r.returncode else "Device" in r.stdout
+
+def locked(gate_s):
+    """bring_up() under a lock, so "rebind" and the service never interleave unbind/bind"""
+    with open("/run/cubietruck-bt.lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        return bring_up(gate_s)
+
+HCICONFIG = bool(sh("command -v hciconfig"))
+if not HCICONFIG:
+    log("hciconfig missing: readiness only checked by hci0 appearing, no setup-failure re-binds")
+if sys.argv[1:] == ["rebind"]:
+    if locked(GATE_S):
+        sys.exit(0)
+    print("NOT clean: the crystal was not good at power-up, run again when it is")
+    sys.exit(1)
+
+clean = locked(GATE_S)
+pause, state = 30, None
+while clean is False:
+    time.sleep(pause)
+    pause = min(pause * 2, 300)
+    c = connected()
+    s = ("BT state unknown" if c is None else "connected" if c else
+         "waiting for the crystal" if not crystal_good() else "ready")
+    if s != state:
+        log(f"lazy re-bind: {s}")
+        state = s
+    if s != "ready":
+        continue
+    log("crystal running again and nothing connected: re-initialising Bluetooth", warn=True)
+    clean = locked(30)
+    pause = 30
+sys.exit(0 if clean else 1)

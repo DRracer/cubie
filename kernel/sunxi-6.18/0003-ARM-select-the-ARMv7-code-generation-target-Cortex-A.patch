@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Fri, 30 Oct 2026 18:37:37 +0100
+Subject: [PATCH] ARM: select the ARMv7 code generation target (Cortex-A7
+ / Cortex-A8)
+
+A Kconfig choice for images that run on one known ARMv7 core:
+- Cortex-A7: ARMv7VE (hardware divide) and Cortex-A7 scheduling, also
+  for NEON objects; the image no longer runs on cores without the
+  virtualization extensions (Cortex-A8 of A10/A13, Cortex-A9).
+- Cortex-A8: ARMv7-A with Cortex-A8 scheduling.
+The default (generic ARMv7-A) keeps the upstream flags. Local patch.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ arch/arm/Makefile   |  7 +++++++
+ arch/arm/mm/Kconfig | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 35 insertions(+)
+
+diff --git a/arch/arm/Makefile b/arch/arm/Makefile
+index b7de4b6b2..4d23a0811 100644
+--- a/arch/arm/Makefile
++++ b/arch/arm/Makefile
+@@ -62,6 +62,7 @@ KBUILD_CFLAGS	+= $(call cc-option,-fno-ipa-sra)
+ # This selects which instruction set is used.
+ arch-$(CONFIG_CPU_32v7M)	:=-march=armv7-m
+ arch-$(CONFIG_CPU_32v7)		:=-march=armv7-a
++arch-$(CONFIG_ARMV7_TUNE_CORTEX_A7)	:=-march=armv7ve
+ arch-$(CONFIG_CPU_32v6)		:=-march=armv6
+ # Only override the compiler option if ARMv6. The ARMv6K extensions are
+ # always available in ARMv7
+@@ -108,6 +109,8 @@ tune-$(CONFIG_CPU_XSC3)		:=-mtune=xscale
+ tune-$(CONFIG_CPU_FEROCEON)	:=-mtune=xscale
+ tune-$(CONFIG_CPU_V6)		:=-mtune=arm1136j-s
+ tune-$(CONFIG_CPU_V6K)		:=-mtune=arm1136j-s
++tune-$(CONFIG_ARMV7_TUNE_CORTEX_A7)	:=-mtune=cortex-a7
++tune-$(CONFIG_ARMV7_TUNE_CORTEX_A8)	:=-mtune=cortex-a8
+ 
+ ifeq ($(CONFIG_AEABI),y)
+ CFLAGS_ABI	:=-mabi=aapcs-linux -mfpu=vfp
+@@ -135,7 +138,11 @@ AFLAGS_NOWARN	:=$(call as-option,-Wa$(comma)-mno-warn-deprecated,-Wa$(comma)-W)
+ CC_FLAGS_FPU	:= -ffreestanding
+ # Enable <arm_neon.h>
+ CC_FLAGS_FPU	+= -isystem $(shell $(CC) -print-file-name=include)
++ifeq ($(CONFIG_ARMV7_TUNE_CORTEX_A7),y)
++CC_FLAGS_FPU	+= -march=armv7ve -mfloat-abi=softfp -mfpu=neon
++else
+ CC_FLAGS_FPU	+= -march=armv7-a -mfloat-abi=softfp -mfpu=neon
++endif
+ 
+ ifeq ($(CONFIG_THUMB2_KERNEL),y)
+ CFLAGS_ISA	:=-Wa,-mimplicit-it=always $(AFLAGS_NOWARN)
+diff --git a/arch/arm/mm/Kconfig b/arch/arm/mm/Kconfig
+index 7b27ee948..50df0054e 100644
+--- a/arch/arm/mm/Kconfig
++++ b/arch/arm/mm/Kconfig
+@@ -742,6 +742,34 @@ config SWP_EMULATE
+ 
+ 	  If unsure, say Y.
+ 
++choice
++	prompt "ARMv7 code generation target"
++	depends on CPU_32v7 && !CPU_32v6 && !CPU_32v7M
++	default ARMV7_TUNE_GENERIC
++	help
++	  Instruction set and scheduling model for an image that only has to
++	  run on one ARMv7 core type.
++
++config ARMV7_TUNE_GENERIC
++	bool "Generic ARMv7-A"
++	help
++	  Runs on every ARMv7-A core.
++
++config ARMV7_TUNE_CORTEX_A7
++	bool "Cortex-A7 (ARMv7VE)"
++	help
++	  ARMv7VE (hardware divide) and Cortex-A7 scheduling, also for NEON
++	  objects. The image does not run on cores without the
++	  virtualization extensions (e.g. Cortex-A8, Cortex-A9).
++
++config ARMV7_TUNE_CORTEX_A8
++	bool "Cortex-A8"
++	help
++	  ARMv7-A with Cortex-A8 scheduling. The image runs on every
++	  ARMv7-A core, it is only tuned for the Cortex-A8.
++
++endchoice
++
+ choice
+ 	prompt "CPU Endianness"
+ 	default CPU_LITTLE_ENDIAN
+-- 
+2.55.0
+

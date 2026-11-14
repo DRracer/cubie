@@ -1,0 +1,16 @@
+From: "D.R.racer" <drracer@seznam.cz>
+Subject: cubietruck: keep upstream DRAM clock 432 MHz, enable optional eMMC slot
+
+Local override of Armbian's patch of the same name (the file name must stay the same):
+same eMMC slot change, but the DRAM clock stays at upstream's 432 MHz.
+Based on Armbian's patch by Igor Pecovnik.
+
+Assisted-by: Claude:claude-opus-5-5
+
+--- a/configs/Cubietruck_defconfig
++++ b/configs/Cubietruck_defconfig
+@@ -27,3 +27,4 @@
+ CONFIG_USB_EHCI_HCD=y
+ CONFIG_USB_OHCI_HCD=y
+ CONFIG_USB_MUSB_GADGET=y
++CONFIG_MMC_SUNXI_SLOT_EXTRA=2

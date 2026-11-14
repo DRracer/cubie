@@ -1,0 +1,61 @@
+From 83826fc05ee244b4a29cecd5ef684ad635f0279c Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Sun, 1 Nov 2026 07:04:18 +0100
+Subject: [PATCH 4/5] drm/lima: cancel a pending heap recovery in the timeout
+ handler
+To: Qiang Yu <yuq825@gmail.com>
+Cc: Erico Nunes <nunes.erico@gmail.com>,
+    Danilo Krummrich <dakr@kernel.org>,
+    Maarten Lankhorst <maarten.lankhorst@linux.intel.com>,
+    Maxime Ripard <mripard@kernel.org>,
+    Thomas Zimmermann <tzimmermann@suse.de>,
+    David Airlie <airlied@gmail.com>,
+    Simona Vetter <simona@ffwll.ch>,
+    lima@lists.freedesktop.org,
+    dri-devel@lists.freedesktop.org,
+    linux-kernel@vger.kernel.org
+
+An out-of-heap interrupt queues pipe->recover_work. If the job then
+fails for another reason (an MMU page fault or the scheduler timeout)
+before the work runs, the timeout handler resets the core and clears
+pipe->current_task, and the work later runs lima_gp_task_recover() on
+the idle core: it dereferences the NULL current_task and restarts the
+PLBU allocation of a job that no longer exists.
+
+After masking the irqs, wait for a handler that may still queue the
+work, cancel the work, and mask the irqs again, since a recovery that
+was already running unmasks the GP irqs and restarts the PLBU.
+
+Found by review; this race has not been observed on hardware.
+
+Fixes: 2081e8dcf1ee ("drm/lima: recover task by enlarging heap buffer")
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/lima/lima_sched.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/gpu/drm/lima/lima_sched.c b/drivers/gpu/drm/lima/lima_sched.c
+index 7e7df5c8a9d..07d2f82ae08 100644
+--- a/drivers/gpu/drm/lima/lima_sched.c
++++ b/drivers/gpu/drm/lima/lima_sched.c
+@@ -436,6 +436,17 @@ static enum drm_gpu_sched_stat lima_sched_timedout_job(struct drm_sched_job *job
+ 	 */
+ 	pipe->task_mask_irq(pipe);
+ 
++	/*
++	 * A heap recovery queued before the error must not run on the reset
++	 * core. An irq handler that started before the mask may still queue
++	 * it, and a running one unmasks the GP irqs again: wait for both,
++	 * then mask once more.
++	 */
++	for (i = 0; i < pipe->num_processor; i++)
++		synchronize_irq(pipe->processor[i]->irq);
++	cancel_work_sync(&pipe->recover_work);
++	pipe->task_mask_irq(pipe);
++
+ 	if (!pipe->error)
+ 		DRM_ERROR("%s job timeout\n", lima_ip_name(ip));
+ 
+-- 
+2.55.0
+

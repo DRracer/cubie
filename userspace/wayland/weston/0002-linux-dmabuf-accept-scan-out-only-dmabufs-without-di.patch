@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Fri, 30 Oct 2026 23:04:30 +0100
+Subject: [PATCH] linux-dmabuf: accept scan-out-only dmabufs without
+ direct-display
+
+A dmabuf the renderer cannot import is refused unless the client marked
+it with weston_direct_display_v1. Generic clients (GStreamer, mpv) do not
+know that Weston protocol, so a buffer that a KMS plane could show, but
+the GPU cannot sample (Allwinner video engine tiled NV12 with lima),
+never gets displayed.
+
+If the renderer import fails but the backend can scan the buffer out,
+accept it as a direct-display buffer: it is only shown on a plane, and
+the renderer draws the usual placeholder otherwise.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ libweston/linux-dmabuf.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/libweston/linux-dmabuf.c b/libweston/linux-dmabuf.c
+index d37121d..45609f3 100644
+--- a/libweston/linux-dmabuf.c
++++ b/libweston/linux-dmabuf.c
+@@ -282,8 +282,16 @@ params_create_common(struct wl_client *client,
+ 		goto avoid_gpu_import;
+ 	}
+ 
+-	if (!weston_compositor_import_dmabuf(buffer->compositor, buffer))
+-		goto err_failed;
++	if (!weston_compositor_import_dmabuf(buffer->compositor, buffer)) {
++		/* The renderer cannot use the buffer, but a plane may be able
++		 * to scan it out (e.g. a format modifier only the display
++		 * engine understands): accept it as a direct-display buffer,
++		 * which is only ever shown on a plane. */
++		if (!weston_compositor_dmabuf_can_scanout(buffer->compositor,
++							  buffer))
++			goto err_failed;
++		buffer->direct_display = true;
++	}
+ 
+ avoid_gpu_import:
+ 	buffer->buffer_resource = wl_resource_create(client,
+-- 
+2.55.0
+

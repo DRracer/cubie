@@ -1,0 +1,79 @@
+From 1c7f23f7c8bf9c1527d937698bfa4e037ff53023 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Tue, 20 Oct 2026 06:56:40 +0200
+Subject: [PATCH 0/3] drm/sun4i: frontend: fix tiled crops and downscaling on A10/A20
+To: Chen-Yu Tsai <wens@kernel.org>,
+    Maxime Ripard <mripard@kernel.org>
+Cc: Jernej Skrabec <jernej.skrabec@gmail.com>,
+    Samuel Holland <samuel@sholland.org>,
+    Maarten Lankhorst <maarten.lankhorst@linux.intel.com>,
+    Thomas Zimmermann <tzimmermann@suse.de>,
+    David Airlie <airlied@gmail.com>,
+    Simona Vetter <simona@ffwll.ch>,
+    dri-devel@lists.freedesktop.org,
+    Paul Kocialkowski <paulk@sys-base.io>,
+    linux-arm-kernel@lists.infradead.org,
+    linux-sunxi@lists.linux.dev,
+    linux-kernel@vger.kernel.org
+
+Three fixes for the A10/A20 display frontend, found while playing
+cedrus-decoded H.264 video on an overlay plane on a Cubietruck (A20) at
+1080p60.
+
+1/3 programs the start address and in-tile offsets of cropped tiled
+    (MB32) sources, which were read from the wrong tiles whenever the
+    source did not start at (0,0), e.g. when a video player crops the
+    source of a window that is partly off the screen.
+2/3 picks the scaler filters by the scaling ratio, as the Allwinner BSP
+    does, instead of one fixed set without low-pass; any downscaled
+    plane aliased. The coefficient table comes from the GPL-licensed
+    linux-sunxi 3.4 BSP kernel; the commit message gives the source.
+3/3 skips every other input line when a plane would need more than
+    the frontend can read per output line (measured: a pixel rate and
+    a DRAM bandwidth limit, budgets derived from the CRTC mode), and
+    rejects planes that exceed it even so; before, the whole screen
+    got corrupted.
+
+2/3 and 3/3 only change the A10/A20 frontend (new quirk flags); the
+A23/A33 frontend keeps its fixed filter and its behaviour. 1/3 changes
+the tiled two-plane path of every frontend this driver handles; it was
+only tested on the A20.
+
+1/3 is a plain fix (Fixes: tag) and does not depend on the other two;
+it can be taken on its own through the fixes tree. 3/3 builds on it.
+
+Testing: 1/3 on a Cubieboard2 (A20) with Armbian's 6.18.56 using
+synthetic tiled NV12 test pictures, 2/3 and 3/3 together on a
+Cubietruck (A20) with 6.18.56 and cedrus-decoded tiled NV12 video
+(1080p60 HDMI, single head; the player side was our own VDPAU driver,
+which is not public yet) and modetest with linear XRGB8888 on an
+overlay plane, which gave the throughput budgets of 3/3. Those tests
+ran an earlier 3/3 that skipped lines beyond a plain ratio of 2; this
+version: tested (XR24 overlay 0.75..0.333 stable, 0.30..0.25 refused; VDPAU NV12
+1280x720..480x270 correct, smaller refused). Other display modes, dual head and the A10 were not
+tested, and the v7.3-rc7 versions were build-tested (W=1, each patch)
+but not booted.
+
+3/3's budgets (260 Mpixels/s, 0.8 GB/s) come from measurements on one
+board at one DRAM clock with one head; they do not account for a slower
+DRAM or a second head's scanout. Opinions on a better model welcome.
+
+The patches were written with an AI assistant; I reviewed and tested
+them.
+
+D.R.racer (3):
+  drm/sun4i: frontend: honour the source offset of tiled semi-planar
+    buffers
+  drm/sun4i: frontend: select the scaler filter by scaling ratio
+  drm/sun4i: frontend: skip input lines to stay within its throughput
+
+ drivers/gpu/drm/sun4i/sun4i_backend.c  |   9 +-
+ drivers/gpu/drm/sun4i/sun4i_frontend.c | 723 ++++++++++++++++++++++++-
+ drivers/gpu/drm/sun4i/sun4i_frontend.h |  20 +
+ 3 files changed, 745 insertions(+), 7 deletions(-)
+
+
+base-commit: f909e534f5e34feb2ea2701d54df63e21aa506fc
+-- 
+2.55.0
+

@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: (GPL-2.0-or-later OR MIT)
+/*
+ * A10 (1 GiB boards): enlarge the default CMA pool from 96 MB to 160 MB (VE codecs + GPU + display).
+ * alloc-ranges stays <0x40000000 0x10000000>: the Video Engine only reaches the first 256 MB of DRAM.
+ * Needs bootm_size=0x20000000 in armbianEnv.txt (else U-Boot puts initrd + DT below 0x4a000000 and the pool
+ * does not fit in the window). Never use the cma= kernel argument instead (it would move the pool out of the window).
+ */
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "allwinner,sun4i-a10";
+
+	fragment@0 {
+		target-path = "/reserved-memory/default-pool";
+		__overlay__ {
+			size = <0x0a000000>;
+		};
+	};
+};

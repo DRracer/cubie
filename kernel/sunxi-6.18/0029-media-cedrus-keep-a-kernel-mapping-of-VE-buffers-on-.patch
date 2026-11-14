@@ -1,0 +1,361 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Fri, 16 Oct 2026 11:34:03 +0200
+Subject: [PATCH] media: cedrus: keep a kernel mapping of VE buffers on
+ ARM32
+
+Buffers that only the VE accesses were allocated with
+DMA_ATTR_NO_KERNEL_MAPPING. dma-direct then returns the pages through
+dma_direct_alloc_no_mapping(), which relies on arch_dma_prep_coherent() to
+remove dirty lines from the kernel's cacheable linear alias. ARM32 does not
+select ARCH_HAS_DMA_PREP_COHERENT, so the call is an empty stub, and the
+ARM allocator that would clean the alias (arch_dma_alloc) is bypassed.
+Lines left dirty there - e.g. by init_on_alloc zeroing the CMA pages
+through the cached alias - are evicted later, over data the VE has
+written in the meantime.
+
+On the A20 (VE 0x1623) this corrupted the H.264 co-located motion vectors
+(MV-col buffers): B frames decoded with displaced blocks, differently on
+every run, until the stale lines were gone (Big Buck Bunny 1080p: 52/300
+frames bit-exact, Y-PSNR 39-55 dB). Giving only the MV-col buffers a
+kernel mapping made them 300/300 bit-exact; so did keeping
+NO_KERNEL_MAPPING but invalidating (discarding, not writing back) their
+linear alias before every job, which rules out the VE merely reading
+memory that was never zeroed.
+
+Use CEDRUS_HW_BUF_ATTRS for all VE-only buffers and the OUTPUT queue: no
+kernel mapping only where the architecture implements
+arch_dma_prep_coherent(). With a kernel mapping, the ARM32 allocator
+flushes the alias and remaps it non-cacheable; CMA is in lowmem on these
+SoCs, so this costs no vmalloc space.
+
+Result (A20, VDPAU and GStreamer): Big Buck Bunny 1080p 300/300 frames
+bit-exact against FFmpeg's software decoder, identical on every run. The
+sporadic decode error on the first frame of a stream (8/100 runs with
+GStreamer) also disappeared (0/100); which buffer caused it was not
+isolated. The encoder's buffers use the same attributes now (same
+allocation pattern; its regression suite passes).
+
+The proper fix belongs in arch/arm or dma-direct (an ARM32
+arch_dma_prep_coherent(), or not taking the no-mapping shortcut for
+non-coherent devices on ARCH_HAS_DMA_ALLOC architectures); this keeps the
+driver safe until then.
+
+Tested on Cubieboard2 and Cubietruck (A20).
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/staging/media/sunxi/cedrus/cedrus.h   | 15 +++++++++
+ .../media/sunxi/cedrus/cedrus_context.c       |  2 +-
+ .../media/sunxi/cedrus/cedrus_dec_h264.c      | 33 +++++++++----------
+ .../media/sunxi/cedrus/cedrus_dec_h265.c      | 14 ++++----
+ .../media/sunxi/cedrus/cedrus_enc_h264.c      | 20 +++++------
+ 5 files changed, 48 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+index a66439833..1b87998ba 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -32,6 +32,21 @@
+ #define CEDRUS_HEIGHT_MIN	16U
+ #define CEDRUS_HEIGHT_MAX	2304U
+ 
++/*
++ * DMA attributes of buffers only the VE accesses (bitstream, auxiliary and
++ * reference buffers). Without a kernel mapping, dma-direct relies on
++ * arch_dma_prep_coherent() to clean the kernel's cacheable linear alias of the
++ * pages it hands out. ARM32 does not implement it, so dirty lines left there by
++ * the pages' previous use (or by init_on_alloc zeroing) are evicted later, over
++ * data the VE has written meanwhile: on the A20 this corrupted the H.264
++ * co-located motion vectors (wrong motion in B frames, different on every
++ * run) and neighbour/bitstream data (sporadic decode errors on the first
++ * frame). With a kernel mapping, the ARM32 allocator flushes the alias and
++ * remaps it non-cacheable.
++ */
++#define CEDRUS_HW_BUF_ATTRS \
++	(IS_ENABLED(CONFIG_ARCH_HAS_DMA_PREP_COHERENT) ? DMA_ATTR_NO_KERNEL_MAPPING : 0)
++
+ enum cedrus_codec {
+ 	CEDRUS_CODEC_MPEG2,
+ 	CEDRUS_CODEC_H264,
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_context.c b/drivers/staging/media/sunxi/cedrus/cedrus_context.c
+index 966bfac6a..b4303f10c 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_context.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_context.c
+@@ -729,7 +729,7 @@ static int cedrus_context_queue_init(void *private, struct vb2_queue *src_queue,
+ 	src_queue->supports_requests = true;
+ 	src_queue->lock = &proc->v4l2.lock;
+ 	src_queue->dev = proc->dev->dev;
+-	src_queue->dma_attrs = DMA_ATTR_NO_KERNEL_MAPPING;
++	src_queue->dma_attrs = CEDRUS_HW_BUF_ATTRS;
+ 	src_queue->drv_priv = ctx;
+ 
+ 	/*
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_dec_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_dec_h264.c
+index 8f05285a9..37355671a 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec_h264.c
+@@ -50,10 +50,7 @@ static int cedrus_dec_h264_setup(struct cedrus_context *cedrus_ctx)
+ 	unsigned int pic_info_buf_size;
+ 	int ret;
+ 
+-	/*
+-	 * NOTE: All buffers allocated here are only used by HW, so we
+-	 * can add DMA_ATTR_NO_KERNEL_MAPPING flag when allocating them.
+-	 */
++	/* All buffers allocated here are only used by HW: CEDRUS_HW_BUF_ATTRS. */
+ 
+ 	/* Formula for picture buffer size is taken from CedarX source. */
+ 
+@@ -75,7 +72,7 @@ static int cedrus_dec_h264_setup(struct cedrus_context *cedrus_ctx)
+ 	h264_ctx->pic_info_buf =
+ 		dma_alloc_attrs(dev, h264_ctx->pic_info_buf_size,
+ 				&h264_ctx->pic_info_buf_dma,
+-				GFP_KERNEL, DMA_ATTR_NO_KERNEL_MAPPING);
++				GFP_KERNEL, CEDRUS_HW_BUF_ATTRS);
+ 	if (!h264_ctx->pic_info_buf)
+ 		return -ENOMEM;
+ 
+@@ -89,7 +86,7 @@ static int cedrus_dec_h264_setup(struct cedrus_context *cedrus_ctx)
+ 	h264_ctx->neighbor_info_buf =
+ 		dma_alloc_attrs(dev, CEDRUS_DEC_H264_NEIGHBOR_INFO_BUF_SIZE,
+ 				&h264_ctx->neighbor_info_buf_dma,
+-				GFP_KERNEL, DMA_ATTR_NO_KERNEL_MAPPING);
++				GFP_KERNEL, CEDRUS_HW_BUF_ATTRS);
+ 	if (!h264_ctx->neighbor_info_buf) {
+ 		ret = -ENOMEM;
+ 		goto error_pic_info_buf;
+@@ -106,7 +103,7 @@ static int cedrus_dec_h264_setup(struct cedrus_context *cedrus_ctx)
+ 		h264_ctx->deblk_buf =
+ 			dma_alloc_attrs(dev, h264_ctx->deblk_buf_size,
+ 					&h264_ctx->deblk_buf_dma,
+-					GFP_KERNEL, DMA_ATTR_NO_KERNEL_MAPPING);
++					GFP_KERNEL, CEDRUS_HW_BUF_ATTRS);
+ 		if (!h264_ctx->deblk_buf) {
+ 			ret = -ENOMEM;
+ 			goto error_neighbor_info_buf;
+@@ -121,7 +118,7 @@ static int cedrus_dec_h264_setup(struct cedrus_context *cedrus_ctx)
+ 		h264_ctx->intra_pred_buf =
+ 			dma_alloc_attrs(dev, h264_ctx->intra_pred_buf_size,
+ 					&h264_ctx->intra_pred_buf_dma,
+-					GFP_KERNEL, DMA_ATTR_NO_KERNEL_MAPPING);
++					GFP_KERNEL, CEDRUS_HW_BUF_ATTRS);
+ 		if (!h264_ctx->intra_pred_buf) {
+ 			ret = -ENOMEM;
+ 			goto error_deblk_buf;
+@@ -134,19 +131,19 @@ static int cedrus_dec_h264_setup(struct cedrus_context *cedrus_ctx)
+ 	dma_free_attrs(dev, h264_ctx->deblk_buf_size,
+ 		       h264_ctx->deblk_buf,
+ 		       h264_ctx->deblk_buf_dma,
+-		       DMA_ATTR_NO_KERNEL_MAPPING);
++		       CEDRUS_HW_BUF_ATTRS);
+ 
+ error_neighbor_info_buf:
+ 	dma_free_attrs(dev, CEDRUS_DEC_H264_NEIGHBOR_INFO_BUF_SIZE,
+ 		       h264_ctx->neighbor_info_buf,
+ 		       h264_ctx->neighbor_info_buf_dma,
+-		       DMA_ATTR_NO_KERNEL_MAPPING);
++		       CEDRUS_HW_BUF_ATTRS);
+ 
+ error_pic_info_buf:
+ 	dma_free_attrs(dev, h264_ctx->pic_info_buf_size,
+ 		       h264_ctx->pic_info_buf,
+ 		       h264_ctx->pic_info_buf_dma,
+-		       DMA_ATTR_NO_KERNEL_MAPPING);
++		       CEDRUS_HW_BUF_ATTRS);
+ 
+ 	return ret;
+ }
+@@ -159,24 +156,24 @@ static void cedrus_dec_h264_cleanup(struct cedrus_context *cedrus_ctx)
+ 	dma_free_attrs(dev, h264_ctx->pic_info_buf_size,
+ 		       h264_ctx->pic_info_buf,
+ 		       h264_ctx->pic_info_buf_dma,
+-		       DMA_ATTR_NO_KERNEL_MAPPING);
++		       CEDRUS_HW_BUF_ATTRS);
+ 
+ 	dma_free_attrs(dev, CEDRUS_DEC_H264_NEIGHBOR_INFO_BUF_SIZE,
+ 		       h264_ctx->neighbor_info_buf,
+ 		       h264_ctx->neighbor_info_buf_dma,
+-		       DMA_ATTR_NO_KERNEL_MAPPING);
++		       CEDRUS_HW_BUF_ATTRS);
+ 
+ 	if (h264_ctx->deblk_buf_size)
+ 		dma_free_attrs(dev, h264_ctx->deblk_buf_size,
+ 			       h264_ctx->deblk_buf,
+ 			       h264_ctx->deblk_buf_dma,
+-			       DMA_ATTR_NO_KERNEL_MAPPING);
++			       CEDRUS_HW_BUF_ATTRS);
+ 
+ 	if (h264_ctx->intra_pred_buf_size)
+ 		dma_free_attrs(dev, h264_ctx->intra_pred_buf_size,
+ 			       h264_ctx->intra_pred_buf,
+ 			       h264_ctx->intra_pred_buf_dma,
+-			       DMA_ATTR_NO_KERNEL_MAPPING);
++			       CEDRUS_HW_BUF_ATTRS);
+ }
+ 
+ /* Buffer */
+@@ -192,7 +189,7 @@ static void cedrus_dec_h264_buffer_cleanup(struct cedrus_context *cedrus_ctx,
+ 		dma_free_attrs(dev, h264_buffer->mv_col_buf_size,
+ 			       h264_buffer->mv_col_buf,
+ 			       h264_buffer->mv_col_buf_dma,
+-			       DMA_ATTR_NO_KERNEL_MAPPING);
++			       CEDRUS_HW_BUF_ATTRS);
+ 
+ 		h264_buffer->mv_col_buf_size = 0;
+ 	}
+@@ -344,12 +341,12 @@ static int cedrus_write_frame_list(struct cedrus_context *ctx)
+ 			field_size = field_size * 2;
+ 
+ 		h264_buffer_picture->mv_col_buf_size = field_size * 2;
+-		/* Buffer is never accessed by CPU, so we can skip kernel mapping. */
++		/* Only the VE accesses this buffer: CEDRUS_HW_BUF_ATTRS. */
+ 		h264_buffer_picture->mv_col_buf =
+ 			dma_alloc_attrs(dev->dev,
+ 					h264_buffer_picture->mv_col_buf_size,
+ 					&h264_buffer_picture->mv_col_buf_dma,
+-					GFP_KERNEL, DMA_ATTR_NO_KERNEL_MAPPING);
++					GFP_KERNEL, CEDRUS_HW_BUF_ATTRS);
+ 
+ 		if (!h264_buffer_picture->mv_col_buf) {
+ 			h264_buffer_picture->mv_col_buf_size = 0;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_dec_h265.c b/drivers/staging/media/sunxi/cedrus/cedrus_dec_h265.c
+index 5ce99b179..1fb200fc2 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec_h265.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec_h265.c
+@@ -104,11 +104,11 @@ static int cedrus_dec_h265_setup(struct cedrus_context *cedrus_ctx)
+ 	struct cedrus_dec_h265_context *h265_ctx = cedrus_ctx->engine_ctx;
+ 	int ret;
+ 
+-	/* Buffer is never accessed by CPU, so we can skip kernel mapping. */
++	/* Only the VE accesses this buffer: CEDRUS_HW_BUF_ATTRS. */
+ 	h265_ctx->neighbor_info_buf =
+ 		dma_alloc_attrs(dev, CEDRUS_DEC_H265_NEIGHBOR_INFO_BUF_SIZE,
+ 				&h265_ctx->neighbor_info_buf_addr, GFP_KERNEL,
+-				DMA_ATTR_NO_KERNEL_MAPPING);
++				CEDRUS_HW_BUF_ATTRS);
+ 	if (!h265_ctx->neighbor_info_buf)
+ 		return -ENOMEM;
+ 
+@@ -131,7 +131,7 @@ static int cedrus_dec_h265_setup(struct cedrus_context *cedrus_ctx)
+ 	dma_free_attrs(dev, CEDRUS_DEC_H265_NEIGHBOR_INFO_BUF_SIZE,
+ 		       h265_ctx->neighbor_info_buf,
+ 		       h265_ctx->neighbor_info_buf_addr,
+-		       DMA_ATTR_NO_KERNEL_MAPPING);
++		       CEDRUS_HW_BUF_ATTRS);
+ 
+ 	return ret;
+ 
+@@ -145,7 +145,7 @@ static void cedrus_dec_h265_cleanup(struct cedrus_context *cedrus_ctx)
+ 	dma_free_attrs(dev, CEDRUS_DEC_H265_NEIGHBOR_INFO_BUF_SIZE,
+ 		       h265_ctx->neighbor_info_buf,
+ 		       h265_ctx->neighbor_info_buf_addr,
+-		       DMA_ATTR_NO_KERNEL_MAPPING);
++		       CEDRUS_HW_BUF_ATTRS);
+ 
+ 	dma_free_coherent(dev, CEDRUS_DEC_H265_ENTRY_POINTS_BUF_SIZE,
+ 			  h265_ctx->entry_points_buf,
+@@ -165,7 +165,7 @@ static void cedrus_dec_h265_buffer_cleanup(struct cedrus_context *cedrus_ctx,
+ 		dma_free_attrs(dev, h265_buffer->mv_col_buf_size,
+ 			       h265_buffer->mv_col_buf,
+ 			       h265_buffer->mv_col_buf_dma,
+-			       DMA_ATTR_NO_KERNEL_MAPPING);
++			       CEDRUS_HW_BUF_ATTRS);
+ 
+ 		h265_buffer->mv_col_buf_size = 0;
+ 	}
+@@ -573,12 +573,12 @@ static int cedrus_dec_h265_job_configure(struct cedrus_context *cedrus_ctx)
+ 			DIV_ROUND_UP(pix_format->height, ctb_size_luma) *
+ 			CEDRUS_DEC_H265_MV_COL_BUF_UNIT_CTB_SIZE + SZ_1K;
+ 
+-		/* Buffer is never accessed by CPU, so we can skip kernel mapping. */
++		/* Only the VE accesses this buffer: CEDRUS_HW_BUF_ATTRS. */
+ 		h265_buffer_picture->mv_col_buf =
+ 			dma_alloc_attrs(dev->dev,
+ 					h265_buffer_picture->mv_col_buf_size,
+ 					&h265_buffer_picture->mv_col_buf_dma,
+-					GFP_KERNEL, DMA_ATTR_NO_KERNEL_MAPPING);
++					GFP_KERNEL, CEDRUS_HW_BUF_ATTRS);
+ 		if (!h265_buffer_picture->mv_col_buf) {
+ 			h265_buffer_picture->mv_col_buf_size = 0;
+ 			return -ENOMEM;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+index 5c92eabbb..6da67fd7d 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -529,10 +529,10 @@ static void cedrus_enc_h264_ref_free(struct device *dev,
+ {
+ 	if (ref->rec)
+ 		dma_free_attrs(dev, ref->rec_size, ref->rec, ref->rec_dma,
+-			       DMA_ATTR_NO_KERNEL_MAPPING);
++			       CEDRUS_HW_BUF_ATTRS);
+ 	if (ref->subpix)
+ 		dma_free_attrs(dev, ref->subpix_size, ref->subpix,
+-			       ref->subpix_dma, DMA_ATTR_NO_KERNEL_MAPPING);
++			       ref->subpix_dma, CEDRUS_HW_BUF_ATTRS);
+ 
+ 	ref->rec = NULL;
+ 	ref->subpix = NULL;
+@@ -571,7 +571,7 @@ static int cedrus_enc_h264_ref_alloc(struct cedrus_context *cedrus_ctx,
+ 				       ALIGN(width, 64) * ALIGN(height, 64) / 4);
+ 
+ 	ref->subpix = dma_alloc_attrs(dev, ref->subpix_size, &ref->subpix_dma,
+-				      GFP_KERNEL, DMA_ATTR_NO_KERNEL_MAPPING);
++				      GFP_KERNEL, CEDRUS_HW_BUF_ATTRS);
+ 	if (!ref->subpix)
+ 		return -ENOMEM;
+ 
+@@ -595,7 +595,7 @@ static int cedrus_enc_h264_ref_alloc(struct cedrus_context *cedrus_ctx,
+ 			      SZ_4K);
+ 
+ 	ref->rec = dma_alloc_attrs(dev, ref->rec_size, &ref->rec_dma,
+-				   GFP_KERNEL, DMA_ATTR_NO_KERNEL_MAPPING);
++				   GFP_KERNEL, CEDRUS_HW_BUF_ATTRS);
+ 	if (!ref->rec) {
+ 		cedrus_enc_h264_ref_free(dev, ref);
+ 		return -ENOMEM;
+@@ -633,7 +633,7 @@ static int cedrus_enc_h264_setup(struct cedrus_context *cedrus_ctx)
+ 					     PAGE_ALIGN(h264_ctx->width_mbs * 16 * 12));
+ 	h264_ctx->mb_info = dma_alloc_attrs(dev, h264_ctx->mb_info_size,
+ 					    &h264_ctx->mb_info_dma, GFP_KERNEL,
+-					    DMA_ATTR_NO_KERNEL_MAPPING);
++					    CEDRUS_HW_BUF_ATTRS);
+ 	if (!h264_ctx->mb_info)
+ 		return -ENOMEM;
+ 
+@@ -643,7 +643,7 @@ static int cedrus_enc_h264_setup(struct cedrus_context *cedrus_ctx)
+ 		h264_ctx->deblk = dma_alloc_attrs(dev, h264_ctx->deblk_size,
+ 						  &h264_ctx->deblk_dma,
+ 						  GFP_KERNEL,
+-						  DMA_ATTR_NO_KERNEL_MAPPING);
++						  CEDRUS_HW_BUF_ATTRS);
+ 		if (!h264_ctx->deblk) {
+ 			ret = -ENOMEM;
+ 			goto error_dma;
+@@ -714,9 +714,9 @@ static int cedrus_enc_h264_setup(struct cedrus_context *cedrus_ctx)
+ 				  h264_ctx->mv_dma);
+ 	if (h264_ctx->deblk)
+ 		dma_free_attrs(dev, h264_ctx->deblk_size, h264_ctx->deblk,
+-			       h264_ctx->deblk_dma, DMA_ATTR_NO_KERNEL_MAPPING);
++			       h264_ctx->deblk_dma, CEDRUS_HW_BUF_ATTRS);
+ 	dma_free_attrs(dev, h264_ctx->mb_info_size, h264_ctx->mb_info,
+-		       h264_ctx->mb_info_dma, DMA_ATTR_NO_KERNEL_MAPPING);
++		       h264_ctx->mb_info_dma, CEDRUS_HW_BUF_ATTRS);
+ 
+ 	return ret;
+ }
+@@ -747,9 +747,9 @@ static void cedrus_enc_h264_cleanup(struct cedrus_context *cedrus_ctx)
+ 	}
+ 	if (h264_ctx->deblk)
+ 		dma_free_attrs(dev, h264_ctx->deblk_size, h264_ctx->deblk,
+-			       h264_ctx->deblk_dma, DMA_ATTR_NO_KERNEL_MAPPING);
++			       h264_ctx->deblk_dma, CEDRUS_HW_BUF_ATTRS);
+ 	dma_free_attrs(dev, h264_ctx->mb_info_size, h264_ctx->mb_info,
+-		       h264_ctx->mb_info_dma, DMA_ATTR_NO_KERNEL_MAPPING);
++		       h264_ctx->mb_info_dma, CEDRUS_HW_BUF_ATTRS);
+ }
+ 
+ /* Buffer */
+-- 
+2.55.0
+

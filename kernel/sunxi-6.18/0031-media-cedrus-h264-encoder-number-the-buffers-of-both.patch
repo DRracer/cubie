@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Fri, 23 Oct 2026 12:08:09 +0200
+Subject: [PATCH] media: cedrus: h264 encoder: number the buffers of both
+ queues
+
+The encoder left v4l2_buffer.sequence at 0 on both queues, which
+v4l2-compliance -s reports as five streaming failures. Number every job:
+the picture (OUTPUT) and coded (CAPTURE) buffers of a job get the same
+value, counted from 0 at each stream start. A failed job consumes a
+number, so userspace sees gaps as lost frames; the empty last buffer of
+a drain carries none.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c | 4 ++++
+ drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h | 6 ++++++
+ 2 files changed, 10 insertions(+)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+index 6da67fd7d..ec9eac5a0 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -622,6 +622,7 @@ static int cedrus_enc_h264_setup(struct cedrus_context *cedrus_ctx)
+ 	/* Everything the error path frees must be valid from here on. */
+ 	h264_ctx->deblk = NULL;
+ 	h264_ctx->mv = NULL;
++	h264_ctx->sequence = 0;
+ 	memset(h264_ctx->refs, 0, sizeof(h264_ctx->refs));
+ 
+ 	/* Macroblock Information Buffer */
+@@ -1604,6 +1605,9 @@ static int cedrus_enc_h264_job_finish(struct cedrus_context *ctx, int state)
+ 				     size, h264_ctx->overflow_qp_bump);
+ 	}
+ 
++	ctx->job.buffer_picture->sequence = h264_ctx->sequence;
++	v4l2_buffer->sequence = h264_ctx->sequence++;
++
+ 	if (state != VB2_BUF_STATE_DONE) {
+ 		/*
+ 		 * The reconstruction of this job is unusable and the decoder
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
+index 6ca119748..f0ebdb062 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.h
+@@ -113,6 +113,12 @@ struct cedrus_enc_h264_context {
+ 	dma_addr_t			mv_dma;
+ 	unsigned int			mv_size;
+ 
++	/*
++	 * Job counter, reported as v4l2_buffer.sequence on both queues. Failed
++	 * jobs consume a number too.
++	 */
++	u32				sequence;
++
+ 	/*
+ 	 * Two slots: one is reconstructed by the current job, the other holds
+ 	 * the reference. The roles swap only after a successful encode, so a
+-- 
+2.55.0
+

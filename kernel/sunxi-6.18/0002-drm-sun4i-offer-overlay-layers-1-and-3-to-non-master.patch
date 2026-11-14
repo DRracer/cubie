@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Thu, 15 Oct 2026 19:41:06 +0200
+Subject: [PATCH] drm/sun4i: offer overlay layers 1 and 3 to non-master
+ clients
+
+Mark backend layers in the client_planes mask (default: 1 = video,
+lowest overlay; 3 = OSD, topmost, the one alpha layer the A20 backend
+allows above the video) as client overlays, and disable them when the
+DRM master is dropped.
+
+Policy: any authenticated local X client can claim these layers, not
+only the video player, and layer 3 covers everything on screen.
+Accepted for single-user A20 desktops; client_planes=0x2 restricts it
+to the video layer, 0 disables the feature.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/sun4i/sun4i_drv.c   |  8 ++++++++
+ drivers/gpu/drm/sun4i/sun4i_layer.c | 14 ++++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_drv.c b/drivers/gpu/drm/sun4i/sun4i_drv.c
+index 6986b3292..a575491a3 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_drv.c
++++ b/drivers/gpu/drm/sun4i/sun4i_drv.c
+@@ -22,6 +22,7 @@
+ #include <drm/drm_gem_dma_helper.h>
+ #include <drm/drm_module.h>
+ #include <drm/drm_of.h>
++#include <drm/drm_plane.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_vblank.h>
+ 
+@@ -43,6 +44,12 @@ static int drm_sun4i_gem_dumb_create(struct drm_file *file_priv,
+ 
+ DEFINE_DRM_GEM_DMA_FOPS(sun4i_drv_fops);
+ 
++static void sun4i_drv_master_drop(struct drm_device *drm,
++				  struct drm_file *file_priv)
++{
++	drm_plane_client_disable_all(drm);
++}
++
+ static const struct drm_driver sun4i_drv_driver = {
+ 	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
+ 
+@@ -52,6 +59,7 @@ static const struct drm_driver sun4i_drv_driver = {
+ 	.desc			= "Allwinner sun4i Display Engine",
+ 	.major			= 1,
+ 	.minor			= 0,
++	.master_drop		= sun4i_drv_master_drop,
+ 
+ 	/* GEM Operations */
+ 	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(drm_sun4i_gem_dumb_create),
+diff --git a/drivers/gpu/drm/sun4i/sun4i_layer.c b/drivers/gpu/drm/sun4i/sun4i_layer.c
+index 98f317636..01f535ffc 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_layer.c
++++ b/drivers/gpu/drm/sun4i/sun4i_layer.c
+@@ -6,6 +6,8 @@
+  * Maxime Ripard <maxime.ripard@free-electrons.com>
+  */
+ 
++#include <linux/module.h>
++
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_blend.h>
+@@ -187,6 +189,15 @@ static const uint64_t sun4i_layer_modifiers[] = {
+ 	DRM_FORMAT_MOD_INVALID
+ };
+ 
++/*
++ * Overlay layers an authenticated non-master client (e.g. a video player
++ * under X) may show with SETPLANE, by layer id: default 1 (video, lowest
++ * overlay) and 3 (OSD, topmost). Layer 0 is the primary and never eligible.
++ */
++static unsigned int client_planes = BIT(1) | BIT(3);
++module_param(client_planes, uint, 0444);
++MODULE_PARM_DESC(client_planes, "Bitmask of overlay layers non-master clients may use (0 = none)");
++
+ static struct sun4i_layer *sun4i_layer_init_one(struct drm_device *drm,
+ 						struct sun4i_backend *backend,
+ 						enum drm_plane_type type,
+@@ -228,6 +239,9 @@ static struct sun4i_layer *sun4i_layer_init_one(struct drm_device *drm,
+ 	drm_plane_create_zpos_property(&layer->plane, layer->id,
+ 				       0, SUN4I_BACKEND_NUM_LAYERS - 1);
+ 
++	layer->plane.client_overlay = type == DRM_PLANE_TYPE_OVERLAY &&
++				      (client_planes & BIT(id));
++
+ 	return layer;
+ }
+ 
+-- 
+2.55.0
+

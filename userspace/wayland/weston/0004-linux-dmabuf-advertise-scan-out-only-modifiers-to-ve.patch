@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Fri, 30 Oct 2026 23:45:08 +0100
+Subject: [PATCH] linux-dmabuf: advertise scan-out-only modifiers to
+ version 3 clients
+
+Clients that bind zwp_linux_dmabuf_v1 below version 4 (e.g. GStreamer
+1.26 waylandsink) only get the renderer's format/modifier pairs, so they
+never use a scan-out-only pair such as the Allwinner video engine's
+NV12 + DRM_FORMAT_MOD_ALLWINNER_TILED, although such buffers are now
+accepted and put on a plane.
+
+Also send the scan-out-only pairs of the feedback format table as
+modifier events.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ libweston/linux-dmabuf.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/libweston/linux-dmabuf.c b/libweston/linux-dmabuf.c
+index 9b358ab..89a975c 100644
+--- a/libweston/linux-dmabuf.c
++++ b/libweston/linux-dmabuf.c
+@@ -1121,6 +1121,26 @@ bind_linux_dmabuf(struct wl_client *client,
+ 			}
+ 		}
+ 	}
++
++	/* Scan-out-only pairs (appended to the feedback format table after
++	 * the renderer's ones, see format_table_append()): a v3 client cannot
++	 * get the scanout tranche, so advertise them here. Only a client that
++	 * produces such buffers (e.g. a video decoder) will use them; they are
++	 * accepted as direct-display buffers. */
++	if (compositor->dmabuf_feedback_format_table &&
++	    version >= ZWP_LINUX_DMABUF_V1_MODIFIER_SINCE_VERSION) {
++		struct weston_dmabuf_feedback_format_table *table =
++			compositor->dmabuf_feedback_format_table;
++		unsigned int first = table->renderer_formats_indices.size /
++				     sizeof(uint16_t);
++		unsigned int n = table->size / sizeof(*table->data);
++
++		for (i = first; i < n; i++)
++			zwp_linux_dmabuf_v1_send_modifier(resource,
++							  table->data[i].format,
++							  table->data[i].modifier >> 32,
++							  table->data[i].modifier & 0xFFFFFFFF);
++	}
+ }
+ 
+ /** Advertise linux_dmabuf support
+-- 
+2.55.0
+

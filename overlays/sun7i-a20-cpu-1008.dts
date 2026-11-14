@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: (GPL-2.0-or-later OR MIT)
+/*
+ * A20: add a 1008 MHz @ 1.45 V operating point (mainline tops out at 960 MHz @ 1.40 V).
+ * 1008 MHz @ 1.45 V is the LV1 entry of the Cubietruck's legacy script.fex dvfs_table.
+ * It is above mainline's tested operating points: watch the temperature, a fan is advised. DCDC2 is limited to 1.45 V in the Cubietruck DT.
+ * The other entries are mainline's.
+ */
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "allwinner,sun7i-a20";
+
+	fragment@0 {
+		target-path = "/cpus/cpu@0";
+		__overlay__ {
+			operating-points =
+				/* kHz	  uV */
+				<1008000 1450000>,
+				<960000	1400000>,
+				<912000	1400000>,
+				<864000	1300000>,
+				<720000	1200000>,
+				<528000	1100000>,
+				<312000	1000000>,
+				<144000	1000000>;
+		};
+	};
+
+	fragment@1 {
+		target-path = "/cpus/cpu@1";
+		__overlay__ {
+			operating-points =
+				/* kHz	  uV */
+				<1008000 1450000>,
+				<960000	1400000>,
+				<912000	1400000>,
+				<864000	1300000>,
+				<720000	1200000>,
+				<528000	1100000>,
+				<312000	1000000>,
+				<144000	1000000>;
+		};
+	};
+};

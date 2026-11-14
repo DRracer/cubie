@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Thu, 15 Oct 2026 14:16:41 +0200
+Subject: [PATCH] media: cedrus: decoder: honour cache hints on CAPTURE,
+ optional dec_cached_capture
+
+Allow userspace to request non-coherent (cacheable) decoder CAPTURE
+buffers via V4L2_MEMORY_FLAG_NON_COHERENT; the dec_cached_capture
+parameter (default off) requests them on userspace's behalf for CPU
+consumers such as GStreamer de-tiling.
+
+Tested on Cubieboard2 (A20).
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../media/sunxi/cedrus/cedrus_context.c       |  2 +
+ .../staging/media/sunxi/cedrus/cedrus_proc.c  | 42 ++++++++++++++++++-
+ 2 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_context.c b/drivers/staging/media/sunxi/cedrus/cedrus_context.c
+index addff9e6f..966bfac6a 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_context.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_context.c
+@@ -755,6 +755,8 @@ static int cedrus_context_queue_init(void *private, struct vb2_queue *src_queue,
+ 	dst_queue->lock = &proc->v4l2.lock;
+ 	dst_queue->dev = proc->dev->dev;
+ 	dst_queue->drv_priv = ctx;
++	/* Decoded pictures may be allocated cacheable (cedrus_proc.c). */
++	dst_queue->allow_cache_hints = proc->role == CEDRUS_ROLE_DECODER;
+ 
+ 	return vb2_queue_init(dst_queue);
+ }
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_proc.c b/drivers/staging/media/sunxi/cedrus/cedrus_proc.c
+index 5b2bf6c60..d77804b19 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_proc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_proc.c
+@@ -372,6 +372,44 @@ static bool cedrus_proc_encoder_busy(struct cedrus_context *ctx)
+ 	       cedrus_context_queue_busy_check(ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE);
+ }
+ 
++/*
++ * Decoded pictures are read by the CPU (de-tiling for display or for
++ * transcoding) and uncached reads are several times slower, but userspace
++ * rarely asks for cacheable buffers itself. Request them on its behalf, on
++ * every allocation call so vb2's coherency model stays consistent; vb2 then
++ * syncs the caches at QBUF/DQBUF.
++ */
++static bool dec_cached_capture;
++module_param(dec_cached_capture, bool, 0644);
++MODULE_PARM_DESC(dec_cached_capture, "Decoder: cacheable CAPTURE (picture) buffers");
++
++static bool cedrus_proc_cache_hint(struct cedrus_context *ctx, u32 type,
++				   u32 memory)
++{
++	return dec_cached_capture && ctx->proc->role == CEDRUS_ROLE_DECODER &&
++	       type == V4L2_BUF_TYPE_VIDEO_CAPTURE && memory == V4L2_MEMORY_MMAP;
++}
++
++static int cedrus_proc_reqbufs(struct file *file, void *private,
++			       struct v4l2_requestbuffers *rb)
++{
++	if (cedrus_proc_cache_hint(cedrus_file2context(file), rb->type,
++				   rb->memory))
++		rb->flags |= V4L2_MEMORY_FLAG_NON_COHERENT;
++
++	return v4l2_m2m_ioctl_reqbufs(file, private, rb);
++}
++
++static int cedrus_proc_create_bufs(struct file *file, void *private,
++				   struct v4l2_create_buffers *create)
++{
++	if (cedrus_proc_cache_hint(cedrus_file2context(file),
++				   create->format.type, create->memory))
++		create->flags |= V4L2_MEMORY_FLAG_NON_COHERENT;
++
++	return v4l2_m2m_ioctl_create_bufs(file, private, create);
++}
++
+ static int cedrus_proc_s_fmt(struct file *file, void *private,
+ 			     struct v4l2_format *format)
+ {
+@@ -709,9 +747,9 @@ static const struct v4l2_ioctl_ops cedrus_proc_ioctl_ops = {
+ 	.vidioc_g_parm			= cedrus_proc_g_parm,
+ 	.vidioc_s_parm			= cedrus_proc_s_parm,
+ 
+-	.vidioc_create_bufs		= v4l2_m2m_ioctl_create_bufs,
++	.vidioc_create_bufs		= cedrus_proc_create_bufs,
+ 	.vidioc_prepare_buf		= v4l2_m2m_ioctl_prepare_buf,
+-	.vidioc_reqbufs			= v4l2_m2m_ioctl_reqbufs,
++	.vidioc_reqbufs			= cedrus_proc_reqbufs,
+ 	.vidioc_querybuf		= v4l2_m2m_ioctl_querybuf,
+ 	.vidioc_expbuf			= v4l2_m2m_ioctl_expbuf,
+ 	.vidioc_qbuf			= v4l2_m2m_ioctl_qbuf,
+-- 
+2.55.0
+

@@ -1,0 +1,311 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Thu, 15 Oct 2026 19:39:59 +0200
+Subject: [PATCH] drm: let an authenticated non-master show a
+ driver-designated overlay plane
+
+Under an X server, which holds DRM master, a video player cannot put
+decoded frames on a hardware overlay plane: SETPLANE is master-only.
+Allow it for planes a driver marks with drm_plane.client_overlay.
+SETPLANE becomes DRM_AUTH; a non-master may only
+- use such an overlay plane, and only while a master exists,
+- show framebuffers it created itself,
+- claim a plane that shows nothing, or keep using its own (-EBUSY),
+- disable a plane it owns.
+Ownership ends when the client disables the plane, when the master sets
+or disables it, and when the client's file closes (the plane is then
+disabled actively). Drivers call drm_plane_client_disable_all() from
+master_drop so a client plane does not outlive the master (VT switch).
+ATOMIC and OBJ_SETPROPERTY stay master-only.
+
+Local patch for A20 boards (zero-copy cedrus playback under X).
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/drm_crtc_internal.h |   1 +
+ drivers/gpu/drm/drm_file.c          |   1 +
+ drivers/gpu/drm/drm_ioctl.c         |   2 +-
+ drivers/gpu/drm/drm_plane.c         | 156 ++++++++++++++++++++++++++++
+ include/drm/drm_plane.h             |  21 ++++
+ 5 files changed, 180 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/drm_crtc_internal.h b/drivers/gpu/drm/drm_crtc_internal.h
+index 89706aa82..d73de42b9 100644
+--- a/drivers/gpu/drm/drm_crtc_internal.h
++++ b/drivers/gpu/drm/drm_crtc_internal.h
+@@ -213,6 +213,7 @@ int drm_framebuffer_check_src_coords(uint32_t src_x, uint32_t src_y,
+ 				     uint32_t src_w, uint32_t src_h,
+ 				     const struct drm_framebuffer *fb);
+ void drm_fb_release(struct drm_file *file_priv);
++void drm_plane_client_release(struct drm_file *file_priv);
+ 
+ int drm_mode_addfb(struct drm_device *dev, struct drm_mode_fb_cmd *or,
+ 		   struct drm_file *file_priv);
+diff --git a/drivers/gpu/drm/drm_file.c b/drivers/gpu/drm/drm_file.c
+index be5e617ce..2d59a95ce 100644
+--- a/drivers/gpu/drm/drm_file.c
++++ b/drivers/gpu/drm/drm_file.c
+@@ -251,6 +251,7 @@ void drm_file_free(struct drm_file *file)
+ 
+ 	if (drm_core_check_feature(dev, DRIVER_MODESET)) {
+ 		drm_fb_release(file);
++		drm_plane_client_release(file);
+ 		drm_property_destroy_user_blobs(dev, file);
+ 	}
+ 
+diff --git a/drivers/gpu/drm/drm_ioctl.c b/drivers/gpu/drm/drm_ioctl.c
+index e81ec3eb5..686b6f9f1 100644
+--- a/drivers/gpu/drm/drm_ioctl.c
++++ b/drivers/gpu/drm/drm_ioctl.c
+@@ -667,7 +667,7 @@ static const struct drm_ioctl_desc drm_ioctls[] = {
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_GETCRTC, drm_mode_getcrtc, 0),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_SETCRTC, drm_mode_setcrtc, DRM_MASTER),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_GETPLANE, drm_mode_getplane, 0),
+-	DRM_IOCTL_DEF(DRM_IOCTL_MODE_SETPLANE, drm_mode_setplane, DRM_MASTER),
++	DRM_IOCTL_DEF(DRM_IOCTL_MODE_SETPLANE, drm_mode_setplane, DRM_AUTH),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_CURSOR, drm_mode_cursor_ioctl, DRM_MASTER),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_GETGAMMA, drm_mode_gamma_get_ioctl, 0),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_SETGAMMA, drm_mode_gamma_set_ioctl, DRM_MASTER),
+diff --git a/drivers/gpu/drm/drm_plane.c b/drivers/gpu/drm/drm_plane.c
+index 4cadea997..48da985ce 100644
+--- a/drivers/gpu/drm/drm_plane.c
++++ b/drivers/gpu/drm/drm_plane.c
+@@ -25,6 +25,7 @@
+ #include <linux/uaccess.h>
+ 
+ #include <drm/drm_plane.h>
++#include <drm/drm_auth.h>
+ #include <drm/drm_drv.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_framebuffer.h>
+@@ -32,6 +33,7 @@
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_fourcc.h>
+ #include <drm/drm_managed.h>
++#include <drm/drm_modeset_lock.h>
+ #include <drm/drm_vblank.h>
+ 
+ #include "drm_crtc_internal.h"
+@@ -1132,6 +1134,136 @@ static int setplane_internal(struct drm_plane *plane,
+ 	return ret;
+ }
+ 
++/* A client may only show framebuffers it created itself. */
++static bool drm_plane_client_owns_fb(struct drm_file *file_priv,
++				     struct drm_framebuffer *fb)
++{
++	struct drm_framebuffer *f;
++	bool found = false;
++
++	mutex_lock(&file_priv->fbs_lock);
++	list_for_each_entry(f, &file_priv->fbs, filp_head) {
++		if (f == fb) {
++			found = true;
++			break;
++		}
++	}
++	mutex_unlock(&file_priv->fbs_lock);
++
++	return found;
++}
++
++static bool drm_plane_shows_fb(struct drm_plane *plane)
++{
++	bool busy;
++
++	drm_modeset_lock(&plane->mutex, NULL);
++	busy = plane->state && plane->state->fb;
++	drm_modeset_unlock(&plane->mutex);
++
++	return busy;
++}
++
++/*
++ * A non-master client may only show its own framebuffers on a
++ * driver-designated overlay plane, only while a master exists, and only on a
++ * plane that is idle or already its own. Only the owner may disable it. An
++ * owner whose plane was turned off by someone else (master, RMFB) no longer
++ * blocks others.
++ */
++static int drm_plane_client_check(struct drm_plane *plane,
++				  struct drm_file *file_priv,
++				  struct drm_framebuffer *fb)
++{
++	struct drm_device *dev = plane->dev;
++
++	lockdep_assert_held(&dev->master_mutex);
++
++	if (!plane->client_overlay || plane->type != DRM_PLANE_TYPE_OVERLAY)
++		return -EACCES;
++	if (!dev->master)
++		return -EACCES;
++	if (fb && !drm_plane_client_owns_fb(file_priv, fb))
++		return -EACCES;
++	if (plane->client_owner == file_priv)
++		return 0;
++	if (!fb)
++		return -EACCES;
++	if (drm_plane_shows_fb(plane))
++		return -EBUSY;
++
++	return 0;
++}
++
++/*
++ * Disable the client planes owned by @file_priv, or by any client if
++ * @file_priv is NULL, and drop their ownership.
++ */
++static void drm_plane_client_disable(struct drm_device *dev,
++				     struct drm_file *file_priv)
++{
++	struct drm_modeset_acquire_ctx ctx;
++	struct drm_plane *plane;
++	bool any = false;
++	int ret;
++
++	lockdep_assert_held(&dev->master_mutex);
++
++	drm_for_each_plane(plane, dev)
++		if (plane->client_owner &&
++		    (!file_priv || plane->client_owner == file_priv))
++			any = true;
++	if (!any)
++		return;
++
++	DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, ret);
++	drm_for_each_plane(plane, dev) {
++		if (!plane->client_owner ||
++		    (file_priv && plane->client_owner != file_priv))
++			continue;
++		if (plane->state->fb) {
++			ret = plane->funcs->disable_plane(plane, &ctx);
++			if (ret)
++				break;
++		}
++		plane->client_owner = NULL;
++	}
++	DRM_MODESET_LOCK_ALL_END(dev, ctx, ret);
++
++	if (ret) {
++		drm_warn(dev, "failed to disable client overlay planes: %d\n", ret);
++		drm_for_each_plane(plane, dev)
++			if (!file_priv || plane->client_owner == file_priv)
++				plane->client_owner = NULL;
++	}
++}
++
++/* Called from drm_file_free() after drm_fb_release(). */
++void drm_plane_client_release(struct drm_file *file_priv)
++{
++	struct drm_device *dev = file_priv->minor->dev;
++
++	mutex_lock(&dev->master_mutex);
++	drm_plane_client_disable(dev, file_priv);
++	mutex_unlock(&dev->master_mutex);
++}
++
++/**
++ * drm_plane_client_disable_all - disable overlay planes shown by non-masters
++ * @dev: DRM device
++ *
++ * Drivers that set &drm_plane.client_overlay call this from their
++ * &drm_driver.master_drop hook, so a client's plane does not stay on screen
++ * when the master goes away (e.g. VT switch). The client learns it from
++ * -EACCES on its next SETPLANE and has to re-issue SETPLANE once a master
++ * exists again. Called with &drm_device.master_mutex held.
++ */
++void drm_plane_client_disable_all(struct drm_device *dev)
++{
++	drm_plane_client_disable(dev, NULL);
++}
++EXPORT_SYMBOL(drm_plane_client_disable_all);
++
+ int drm_mode_setplane(struct drm_device *dev, void *data,
+ 		      struct drm_file *file_priv)
+ {
+@@ -1139,6 +1271,7 @@ int drm_mode_setplane(struct drm_device *dev, void *data,
+ 	struct drm_plane *plane;
+ 	struct drm_crtc *crtc = NULL;
+ 	struct drm_framebuffer *fb = NULL;
++	bool client, locked;
+ 	int ret;
+ 
+ 	if (!drm_core_check_feature(dev, DRIVER_MODESET))
+@@ -1172,12 +1305,35 @@ int drm_mode_setplane(struct drm_device *dev, void *data,
+ 		}
+ 	}
+ 
++	/*
++	 * The IOCTL is DRM_AUTH; anything but a client overlay needs master.
++	 * master_mutex is held across the (vblank-synchronous) commit on
++	 * client overlays, so a racing master drop cannot leave a client plane
++	 * on screen; it may delay master changes by about one frame.
++	 */
++	locked = plane->client_overlay;
++	if (locked)
++		mutex_lock(&dev->master_mutex);
++	client = !drm_is_current_master(file_priv);
++	if (client) {
++		ret = locked ? drm_plane_client_check(plane, file_priv, fb) :
++			       -EACCES;
++		if (ret)
++			goto out;
++	}
++
+ 	ret = setplane_internal(plane, crtc, fb,
+ 				plane_req->crtc_x, plane_req->crtc_y,
+ 				plane_req->crtc_w, plane_req->crtc_h,
+ 				plane_req->src_x, plane_req->src_y,
+ 				plane_req->src_w, plane_req->src_h);
+ 
++	/* A master taking over or disabling the plane ends client ownership. */
++	if (locked && !ret)
++		plane->client_owner = client && fb ? file_priv : NULL;
++out:
++	if (locked)
++		mutex_unlock(&dev->master_mutex);
+ 	if (fb)
+ 		drm_framebuffer_put(fb);
+ 
+diff --git a/include/drm/drm_plane.h b/include/drm/drm_plane.h
+index 01479dd94..cd4dd1c64 100644
+--- a/include/drm/drm_plane.h
++++ b/include/drm/drm_plane.h
+@@ -803,6 +803,25 @@ struct drm_plane {
+ 	 * @kmsg_panic: Used to register a panic notifier for this plane
+ 	 */
+ 	struct kmsg_dumper kmsg_panic;
++
++	/**
++	 * @client_overlay:
++	 *
++	 * Driver opt-in: an authenticated client that is not the master may
++	 * show this overlay plane with the legacy SETPLANE IOCTL while a
++	 * master exists, e.g. a video player under an X server that keeps
++	 * the primary plane. One client at a time; the plane is disabled
++	 * when the master is dropped (see drm_plane_client_disable_all()).
++	 */
++	bool client_overlay;
++
++	/**
++	 * @client_owner:
++	 *
++	 * Non-master file currently showing this @client_overlay plane, or
++	 * NULL. Protected by &drm_device.master_mutex.
++	 */
++	struct drm_file *client_owner;
+ };
+ 
+ #define obj_to_plane(x) container_of(x, struct drm_plane, base)
+@@ -932,6 +951,8 @@ static inline u32 drm_plane_mask(const struct drm_plane *plane)
+ struct drm_plane * drm_plane_from_index(struct drm_device *dev, int idx);
+ void drm_plane_force_disable(struct drm_plane *plane);
+ 
++void drm_plane_client_disable_all(struct drm_device *dev);
++
+ int drm_mode_plane_set_obj_prop(struct drm_plane *plane,
+ 				       struct drm_property *property,
+ 				       uint64_t value);
+-- 
+2.55.0
+

@@ -1,0 +1,212 @@
+From 9a5ed792fb64617c12e4d3d880a031da5e414cb3 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Tue, 20 Oct 2026 06:19:53 +0200
+Subject: [PATCH] drm/sun4i: backend: support async page flips
+To: Chen-Yu Tsai <wens@kernel.org>,
+    Maxime Ripard <mripard@kernel.org>
+Cc: Jernej Skrabec <jernej.skrabec@gmail.com>,
+    Samuel Holland <samuel@sholland.org>,
+    Maarten Lankhorst <maarten.lankhorst@linux.intel.com>,
+    Thomas Zimmermann <tzimmermann@suse.de>,
+    David Airlie <airlied@gmail.com>,
+    Simona Vetter <simona@ffwll.ch>,
+    dri-devel@lists.freedesktop.org,
+    linux-arm-kernel@lists.infradead.org,
+    linux-sunxi@lists.linux.dev,
+    linux-kernel@vger.kernel.org
+
+Without DRM_CAP_ASYNC_PAGE_FLIP, the X server's Present extension cannot
+flip a fullscreen window that swaps with interval 0, and copies every
+frame into the front buffer instead.
+
+The backend layer registers are loaded at the next vblank, and a pending
+load cannot be cancelled (LOADCTL ignores writes of 0). An async flip
+therefore only rewrites the low 32 bits of the primary layer address,
+which the hardware takes in one write, skips the wait for the previous
+load and sends its event at flush. A later flip in the same frame
+replaces the address before it is latched. As with any async flip, the
+previous buffer may still be scanned out when userspace reuses it, so
+content can tear.
+
+Async flips that change the format, the modifier, the pitch or the upper
+address bits, or with a plane going through the frontend, are refused.
+
+Tested on a Cubietruck (A20, 2 GiB) with Armbian's 6.18.56 under Xorg
+(modesetting, glamor on lima), single 1080p60 HDMI head, glmark2
+--fullscreen (swap interval 0): the X server now flips instead of
+copying each frame, and an ftrace of the GPU jobs shows no more jobs
+from Xorg. The build scene went from 29 to 108 FPS; the DRAM clock was
+384 MHz in the first run and 432 MHz in the second, which on its own
+gave 4-14% in other glmark2 runs on this board. A 20-minute run with
+async flips showed no warnings. With a video plane on the frontend,
+async flips are refused and X falls back to copying. Not tested on
+A10; the v7.3-rc7 version was build-tested only.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+This applies on top of "drm/sun4i: backend: expose the hardware cursor
+as a cursor plane" (sent separately): it uses the cursor-only shortcut
+in the backend's atomic_check and skips the cursor plane, whose state
+is not a sun4i_layer_state. That is also the combination that was
+tested.
+
+Tested on Armbian's 6.18.56 with the cursor patch and out-of-tree VGA
+patches. The v7.3-rc7 version differs from the tested one only in the
+v7.3 type names (struct drm_atomic_commit) and in the plane loop of
+sun4i_backend_async_check(), which now skips the cursor plane before
+looking at the layer state and uses container_of_const(); it was built
+with W=1 on v7.3-rc7 but not booted.
+
+The patch was written with an AI assistant; I reviewed and tested it.
+
+ drivers/gpu/drm/sun4i/sun4i_backend.c | 55 +++++++++++++++++++++++++++
+ drivers/gpu/drm/sun4i/sun4i_crtc.c    | 21 +++++++++-
+ drivers/gpu/drm/sun4i/sun4i_layer.c   |  8 ++++
+ 3 files changed, 82 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.c b/drivers/gpu/drm/sun4i/sun4i_backend.c
+index 236fecf80..18e5339d1 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -471,6 +471,55 @@ static void sun4i_backend_atomic_begin(struct sunxi_engine *engine,
+ 					 100, 50000));
+ }
+ 
++/*
++ * A pending register load cannot be cancelled (LOADCTL ignores writes of
++ * 0), so a vblank may latch the layer registers in the middle of an
++ * update. An async flip is therefore limited to the one register that
++ * changes atomically: the low 32 bits of the primary layer address. The
++ * flip is refused if anything else would change or a plane goes through
++ * the frontend. The uses_frontend flags are those of the previous commit,
++ * which stay valid as format, modifier and pitch must not change and a
++ * flip cannot change the plane geometry.
++ */
++static int sun4i_backend_async_check(struct drm_crtc_state *crtc_state)
++{
++	struct drm_atomic_commit *state = crtc_state->state;
++	struct drm_plane *primary = crtc_state->crtc->primary;
++	struct drm_plane_state *old_state, *new_state;
++	const struct drm_plane_state *plane_state;
++	struct drm_plane *plane;
++
++	drm_atomic_crtc_state_for_each_plane_state(plane, plane_state, crtc_state) {
++		const struct sun4i_layer_state *layer_state;
++
++		/* the hardware cursor is not a layer */
++		if (plane->type == DRM_PLANE_TYPE_CURSOR)
++			continue;
++
++		layer_state = container_of_const(plane_state,
++						 struct sun4i_layer_state, state);
++		if (layer_state->uses_frontend)
++			return -EINVAL;
++	}
++
++	old_state = drm_atomic_get_old_plane_state(state, primary);
++	new_state = drm_atomic_get_new_plane_state(state, primary);
++	if (!old_state || !new_state || !old_state->fb || !new_state->fb)
++		return -EINVAL;
++
++	if (new_state->fb->format != old_state->fb->format ||
++	    new_state->fb->modifier != old_state->fb->modifier ||
++	    new_state->fb->format->is_yuv ||
++	    new_state->fb->pitches[0] != old_state->fb->pitches[0])
++		return -EINVAL;
++
++	if (drm_fb_dma_get_gem_addr(new_state->fb, new_state, 0) >> 29 !=
++	    drm_fb_dma_get_gem_addr(old_state->fb, old_state, 0) >> 29)
++		return -EINVAL;
++
++	return 0;
++}
++
+ static int sun4i_backend_atomic_check(struct sunxi_engine *engine,
+ 				      struct drm_crtc_state *crtc_state)
+ {
+@@ -498,6 +547,9 @@ static int sun4i_backend_atomic_check(struct sunxi_engine *engine,
+ 	    sun4i_crtc_cursor_only(state, crtc_state->crtc))
+ 		return 0;
+ 
++	if (crtc_state->async_flip)
++		return sun4i_backend_async_check(crtc_state);
++
+ 	drm_for_each_plane_mask(plane, drm, crtc_state->plane_mask) {
+ 		/* the hardware cursor is not a layer */
+ 		if (plane->type == DRM_PLANE_TYPE_CURSOR)
+@@ -828,6 +880,9 @@ static int sun4i_backend_bind(struct device *dev, struct device *master,
+ 	if (drm_dev_dma_dev(drm) == drm->dev)
+ 		drm_dev_set_dma_dev(drm, dev);
+ 
++	/* See sun4i_backend_async_check() for what an async flip may change */
++	drm->mode_config.async_page_flip = true;
++
+ 	backend->engine.node = dev->of_node;
+ 	backend->engine.ops = &sun4i_backend_engine_ops;
+ 	backend->engine.id = sun4i_backend_of_get_id(dev->of_node);
+diff --git a/drivers/gpu/drm/sun4i/sun4i_crtc.c b/drivers/gpu/drm/sun4i/sun4i_crtc.c
+index ca54885c9..f843f24e9 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_crtc.c
++++ b/drivers/gpu/drm/sun4i/sun4i_crtc.c
+@@ -70,6 +70,15 @@ static void sun4i_crtc_atomic_begin(struct drm_crtc *crtc,
+ 	struct sunxi_engine *engine = scrtc->engine;
+ 	unsigned long flags;
+ 
++	/*
++	 * An async flip waits neither for the previous register load nor for
++	 * its own: its event is sent at flush, so userspace may flip again
++	 * before the next vblank, and the latest address is latched then. As
++	 * with any async flip, the old buffer may still be scanned out.
++	 */
++	if (crtc->state->async_flip)
++		return;
++
+ 	if (crtc->state->event) {
+ 		WARN_ON(drm_crtc_vblank_get(crtc) != 0);
+ 
+@@ -103,10 +112,18 @@ static void sun4i_crtc_atomic_flush(struct drm_crtc *crtc,
+ 		crtc->state->event = NULL;
+ 
+ 		spin_lock_irq(&crtc->dev->event_lock);
+-		if (drm_crtc_vblank_get(crtc) == 0)
++		if (crtc->state->async_flip) {
++			/* the reference keeps the event's count and time current */
++			bool vblank_on = drm_crtc_vblank_get(crtc) == 0;
++
++			drm_crtc_send_vblank_event(crtc, event);
++			if (vblank_on)
++				drm_crtc_vblank_put(crtc);
++		} else if (drm_crtc_vblank_get(crtc) == 0) {
+ 			drm_crtc_arm_vblank_event(crtc, event);
+-		else
++		} else {
+ 			drm_crtc_send_vblank_event(crtc, event);
++		}
+ 		spin_unlock_irq(&crtc->dev->event_lock);
+ 	}
+ }
+diff --git a/drivers/gpu/drm/sun4i/sun4i_layer.c b/drivers/gpu/drm/sun4i/sun4i_layer.c
+index 6edd1402c..58d9928eb 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_layer.c
++++ b/drivers/gpu/drm/sun4i/sun4i_layer.c
+@@ -93,6 +93,14 @@ static void sun4i_backend_layer_atomic_update(struct drm_plane *plane,
+ 	struct sun4i_layer *layer = plane_to_sun4i_layer(plane);
+ 	struct sun4i_backend *backend = layer->backend;
+ 	struct sun4i_frontend *frontend = backend->frontend;
++	struct drm_crtc_state *crtc_state =
++		drm_atomic_get_new_crtc_state(state, new_state->crtc);
++
++	/* Only the address changes, see sun4i_backend_async_check() */
++	if (crtc_state && crtc_state->async_flip) {
++		sun4i_backend_update_layer_buffer(backend, layer->id, plane);
++		return;
++	}
+ 
+ 	sun4i_backend_cleanup_layer(backend, layer->id);
+ 
+
+base-commit: f909e534f5e34feb2ea2701d54df63e21aa506fc
+prerequisite-patch-id: 28fb314e643dfad038bba2be9b2c3b18116ef6c8
+-- 
+2.55.0
+

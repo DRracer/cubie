@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Wed, 28 Oct 2026 18:55:41 +0100
+Subject: [PATCH] media: v4l2-jpeg: fix the end of DHT parsing and bound
+ jpeg_skip()
+
+jpeg_parse_huffman_tables() subtracts the two length bytes from len
+before its loop, but ends with jpeg_skip(stream, len - 2). For every
+well-formed DHT segment len is 0 there, so it asks to skip -2 bytes.
+The size_t wraps, stream->curr + len wraps to two bytes before the
+current position, the bounds check passes, and parsing resumes on the
+last two HUFFVAL bytes. Valid baseline tables never hold 0xff there, so
+this goes unnoticed, but a table that ends in ff db makes the parser
+take a DQT marker that is not there.
+
+A table whose BITS count more symbols than the segment holds is not
+rejected either: HUFFVAL is read from the following segments and the
+loop leaves len negative, which again turns into a backwards skip, so
+the bogus table can be accepted. jpeg_parse_quantization_tables() has the
+same overrun for 16-bit tables (it only checks for 65 bytes left), and
+it does not skip what is left of its segment at all, so trailing bytes
+are scanned for markers. An APP14 "Adobe" segment shorter than 14
+bytes (or any APP14 segment shorter than its length field) reaches
+jpeg_skip() with a negative length the same way and is accepted, an
+Adobe one with a transform flag read from the next segment.
+
+Reject tables that overrun their segment, skip the remainder of DHT and
+DQT segments with the right length, and make jpeg_skip() compare with
+the bytes left instead of computing a pointer past the buffer, so a
+negative length fails.
+
+Well-formed files parse as before: for 1180 frames from libjpeg-turbo,
+ffmpeg, PIL, ImageMagick, a Logitech C170 camera and hand-made files,
+the result of
+v4l2_jpeg_parse_header() is identical before and after, every offset,
+length and field, with and without table arrays.
+
+Same code as the upstream series "media: v4l2-jpeg: fix segment length
+handling in the header parser" (3 patches, folded into one here).
+
+Fixes: 50733b5b9102 ("media: add v4l2 JPEG helpers")
+Fixes: b8035f7988a8 ("media: Add parsing for APP14 data segment in jpeg helpers")
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/media/v4l2-core/v4l2-jpeg.c | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/v4l2-core/v4l2-jpeg.c b/drivers/media/v4l2-core/v4l2-jpeg.c
+index 36a0f1a1b..0258abdfb 100644
+--- a/drivers/media/v4l2-core/v4l2-jpeg.c
++++ b/drivers/media/v4l2-core/v4l2-jpeg.c
+@@ -203,7 +203,12 @@ static int jpeg_get_word_be(struct jpeg_stream *stream)
+ 
+ static int jpeg_skip(struct jpeg_stream *stream, size_t len)
+ {
+-	if (stream->curr + len > stream->end)
++	/*
++	 * Callers compute lengths as int: a negative one becomes a huge size_t
++	 * here. Compare with the bytes left, so the pointer addition can
++	 * neither wrap nor move backwards.
++	 */
++	if (len > (size_t)(stream->end - stream->curr))
+ 		return -EINVAL;
+ 
+ 	stream->curr += len;
+@@ -447,6 +452,9 @@ static int jpeg_parse_quantization_tables(struct jpeg_stream *stream,
+ 		 */
+ 		if (pq != 0 && (pq != 1 || precision != 12))
+ 			return -EINVAL;
++		/* the table must fit in the segment */
++		if (len < (pq ? 129 : 65))
++			return -EINVAL;
+ 
+ 		/* quantization table destination identifier */
+ 		tq = pq_tq & 0xf;
+@@ -467,7 +475,8 @@ static int jpeg_parse_quantization_tables(struct jpeg_stream *stream,
+ 		len -= pq ? 129 : 65;
+ 	}
+ 
+-	return 0;
++	/* Skip what is left of the segment, as for the other segments. */
++	return jpeg_skip(stream, len);
+ }
+ 
+ /* B.2.4.2 Huffman table-specification syntax */
+@@ -514,6 +523,9 @@ static int jpeg_parse_huffman_tables(struct jpeg_stream *stream,
+ 
+ 			mt += li;
+ 		}
++		/* Tc/Th, BITS and HUFFVAL must fit in the segment */
++		if (17 + mt > len)
++			return -EINVAL;
+ 		/* HUFFVAL - values associated with each Huffman code */
+ 		ret = jpeg_skip(stream, mt);
+ 		if (ret < 0)
+@@ -525,7 +537,8 @@ static int jpeg_parse_huffman_tables(struct jpeg_stream *stream,
+ 		}
+ 	}
+ 
+-	return jpeg_skip(stream, len - 2);
++	/* len no longer includes the length field itself. */
++	return jpeg_skip(stream, len);
+ }
+ 
+ /* B.2.4.4 Restart interval definition syntax */
+-- 
+2.55.0
+

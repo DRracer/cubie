@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Tue, 20 Oct 2026 06:33:29 +0200
+Subject: [PATCH] soc: sunxi: mbus: add the A10/A20 mixer processor
+
+The A20 mixer processor (2D engine) is an MBUS master. Like the display
+engine, the video engine and the Mali GPU it sees DRAM at bus address 0
+rather than at PHYS_OFFSET, so it needs the same DMA offset. The legacy
+3.4 driver subtracted 0x40000000 from every address it programmed.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/soc/sunxi/sunxi_mbus.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/soc/sunxi/sunxi_mbus.c b/drivers/soc/sunxi/sunxi_mbus.c
+index 60b670585..eb374d47f 100644
+--- a/drivers/soc/sunxi/sunxi_mbus.c
++++ b/drivers/soc/sunxi/sunxi_mbus.c
+@@ -33,6 +33,7 @@ static const char * const sunxi_mbus_devices[] = {
+ 	"allwinner,sun4i-a10-display-backend",
+ 	"allwinner,sun4i-a10-display-frontend",
+ 	"allwinner,sun4i-a10-mali",
++	"allwinner,sun4i-a10-mixer-processor",
+ 	"allwinner,sun4i-a10-video-engine",
+ 	"allwinner,sun5i-a13-display-backend",
+ 	"allwinner,sun5i-a13-video-engine",
+-- 
+2.55.0
+

@@ -1,0 +1,1099 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Tue, 20 Oct 2026 06:34:03 +0200
+Subject: [PATCH] drm/sun4i: add a driver for the A10/A20 mixer processor
+
+The A20 mixer processor (MP, "G2D" in the vendor kernel) is a 2D engine
+that copies, fills and alpha-blends rectangles at about 130 Mpix/s
+(copy, bound by DRAM bandwidth). On the A20 the X server presents GL
+windows and copies areas with glamor on the Mali-400, where each copy
+costs a full tile reload and write-back of the destination; offloading
+these copies to MP frees the GPU and uses less DRAM bandwidth.
+
+The driver is a render-only DRM device without allocation: buffers come
+from other drivers (sun4i-drm dumb/scanout buffers) as dma-bufs through
+PRIME import. The DMA GEM helper rejects anything that is not
+contiguous in the DMA address space of MP, which is all the engine can
+address, and the mapping made for MP carries its MBUS DMA offset. Since
+a missing offset would make MP write 1 GiB away from the buffers on
+boards with 2 GiB of DRAM, the probe checks the device's DMA range map
+and every buffer's bus address is checked against its physical address.
+
+One synchronous ioctl runs a batch of up to 256 rectangles of one
+operation (copy, fill, or non-premultiplied source-over blend) between
+two linear ARGB8888/XRGB8888 surfaces. It waits for the implicit fences
+of the buffers first, validates every rectangle against the surface and
+the object size before the engine is touched, and reports how many
+rectangles were done if the engine fails mid-batch. The engine does no
+cache maintenance, so the buffers must be write-combined, as sun4i-drm
+buffers are. Overlapping copies inside one buffer need a scan order
+that is not verified on hardware yet and are refused unless the
+allow_overlap module parameter is set.
+
+The engine is clocked and taken out of reset only while in use (runtime
+PM with autosuspend), is reset after a timeout or an error, and is
+disabled for good if it stays busy after a reset.
+
+The register programming follows the linux-sunxi 3.4 sunxi_g2d driver
+and the A20 user manual. Copy, fill and blend of ARGB8888 were verified
+from user space through /dev/mem; the interrupt, the XRGB8888 paths and
+the recovery are new in this driver.
+
+Tested on a Rikomagic MK802 (A10) as well: verify, negative and overlap
+tests pass.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/gpu/drm/sun4i/Kconfig    |  12 +
+ drivers/gpu/drm/sun4i/Makefile   |   2 +
+ drivers/gpu/drm/sun4i/sun4i_mp.c | 870 +++++++++++++++++++++++++++++++
+ include/uapi/drm/sun4i_mp_drm.h  | 117 +++++
+ 4 files changed, 1001 insertions(+)
+ create mode 100644 drivers/gpu/drm/sun4i/sun4i_mp.c
+ create mode 100644 include/uapi/drm/sun4i_mp_drm.h
+
+diff --git a/drivers/gpu/drm/sun4i/Kconfig b/drivers/gpu/drm/sun4i/Kconfig
+index 122141b42..d5006ac1d 100644
+--- a/drivers/gpu/drm/sun4i/Kconfig
++++ b/drivers/gpu/drm/sun4i/Kconfig
+@@ -57,6 +57,18 @@ config DRM_SUN4I_BACKEND
+ 	  do some alpha blending and feed graphics to TCON. If M is
+ 	  selected the module will be called sun4i-backend.
+ 
++config DRM_SUN4I_MP
++	tristate "Support for the Allwinner A10/A20 Mixer Processor (2D engine)"
++	depends on ARM || COMPILE_TEST
++	depends on PM
++	select DRM_GEM_DMA_HELPER
++	help
++	  Choose this option to use the 2D engine of the Allwinner A10/A20
++	  (mixer processor, also known as G2D). It copies, fills and
++	  blends rectangles between physically contiguous buffers that
++	  user space imports as dma-bufs through a render node. If M is
++	  selected the module will be called sun4i-mp.
++
+ config DRM_SUN6I_DSI
+ 	tristate "Allwinner A31/A64 MIPI-DSI Controller Support"
+ 	default DRM_SUN4I
+diff --git a/drivers/gpu/drm/sun4i/Makefile b/drivers/gpu/drm/sun4i/Makefile
+index a3b9c7df9..00af52331 100644
+--- a/drivers/gpu/drm/sun4i/Makefile
++++ b/drivers/gpu/drm/sun4i/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ sun4i-backend-y			+= sun4i_backend.o sun4i_layer.o
+ sun4i-frontend-y		+= sun4i_frontend.o
++sun4i-mp-y			+= sun4i_mp.o
+ 
+ sun4i-drm-y			+= sun4i_drv.o
+ sun4i-drm-y			+= sun4i_framebuffer.o
+@@ -36,6 +37,7 @@ obj-$(CONFIG_DRM_SUN4I_BACKEND)	+= sun4i-backend.o
+ ifdef CONFIG_DRM_SUN4I_BACKEND
+ obj-$(CONFIG_DRM_SUN4I)		+= sun4i-frontend.o
+ endif
++obj-$(CONFIG_DRM_SUN4I_MP)	+= sun4i-mp.o
+ obj-$(CONFIG_DRM_SUN4I_HDMI)	+= sun4i-drm-hdmi.o
+ obj-$(CONFIG_DRM_SUN6I_DSI)	+= sun6i_mipi_dsi.o
+ obj-$(CONFIG_DRM_SUN8I_DW_HDMI)	+= sun8i-drm-hdmi.o
+diff --git a/drivers/gpu/drm/sun4i/sun4i_mp.c b/drivers/gpu/drm/sun4i/sun4i_mp.c
+new file mode 100644
+index 000000000..ffbee20dd
+--- /dev/null
++++ b/drivers/gpu/drm/sun4i/sun4i_mp.c
+@@ -0,0 +1,870 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Allwinner A10/A20 mixer processor (MP, "G2D") 2D engine
++ *
++ * Copyright (C) 2026 D.R.racer <drracer@seznam.cz>
++ *
++ * The register programming follows the linux-sunxi 3.4 sunxi_g2d driver
++ * (g2d_bsp.c) and the A20 User Manual v1.4, chapter 3.1. The engine works
++ * on physically contiguous buffers only; user space imports them as
++ * dma-bufs and passes rectangles to a synchronous blit ioctl.
++ */
++
++#include <linux/clk.h>
++#include <linux/completion.h>
++#include <linux/delay.h>
++#include <linux/dma-direct.h>
++#include <linux/dma-mapping.h>
++#include <linux/dma-resv.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/jiffies.h>
++#include <linux/minmax.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/reset.h>
++#include <linux/scatterlist.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++
++#include <drm/drm_drv.h>
++#include <drm/drm_file.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_gem.h>
++#include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_ioctl.h>
++#include <drm/drm_print.h>
++#include <drm/sun4i_mp_drm.h>
++
++#define MP_CTL				0x000
++#define MP_CTL_EN			BIT(0)
++#define MP_CTL_START			BIT(1)
++#define MP_CTL_FINISH_IRQ_EN		BIT(8)
++#define MP_CTL_ERR_IRQ_EN		BIT(9)
++#define MP_STS				0x004
++#define MP_STS_FINISH			BIT(8)
++#define MP_STS_ERR			BIT(9)
++#define MP_STS_BUSY			BIT(12)
++#define MP_STS_HWERR			BIT(13)
++#define MP_SCAN				0x008
++#define MP_SCAN_BOTTOM_UP		(2 << 8)
++#define MP_DMA_HADDR			0x00c
++#define MP_DMA_HADDR_CH(ch, bitaddr)	((u32)(((bitaddr) >> 32) & 0xf) << (8 * (ch)))
++#define MP_DMA_LADDR(ch)		(0x010 + 4 * (ch))
++#define MP_DMA_STRIDE(ch)		(0x020 + 4 * (ch))
++#define MP_DMA_SIZE(ch)			(0x030 + 4 * (ch))
++#define MP_DMA_CTL(ch)			(0x050 + 4 * (ch))
++#define MP_DMA_CTL_EN			BIT(0)
++#define MP_DMA_CTL_ALPHA_GLOBAL		BIT(2)	/* alpha mode 1: global */
++#define MP_DMA_CTL_FILL_EN		BIT(16)
++#define MP_DMA_CTL_GLOBAL_ALPHA(a)	((u32)(a) << 24)
++#define MP_DMA_FILL(ch)			(0x060 + 4 * (ch))
++#define MP_ROP_IDX0			0x0b8
++#define MP_ROP_IDX0_OR			0x840
++#define MP_CK_CTL			0x0c0
++#define MP_CK_CTL_ALPHA_EN		BIT(0)
++#define MP_OUT_CTL			0x0e0
++#define MP_OUT_CTL_ARGB8888		0x80
++#define MP_OUT_SIZE			0x0e8
++#define MP_OUT_HADDR			0x0ec
++#define MP_OUT_LADDR0			0x0f0
++#define MP_OUT_STRIDE0			0x100
++#define MP_OALPHA_CTL			0x120
++#define MP_OALPHA_CTL_BLEND		0x80
++#define MP_CSC01_COEF			0x180
++#define MP_CSC2_COEF			0x1c0
++#define MP_SCALER_COEF			0x200
++
++#define MP_SIZE(w, h)			(((w) - 1) | (((h) - 1) << 16))
++
++#define SUN4I_MP_SRC_CH			0
++#define SUN4I_MP_DST_CH			3
++
++/* the 3.4 driver capped the clock at 240 MHz; 288 MHz worked in tests */
++#define SUN4I_MP_DEFAULT_RATE		240000000UL
++#define SUN4I_MP_MAX_RATE		300000000UL
++
++#define SUN4I_MP_AUTOSUSPEND_MS		100
++#define SUN4I_MP_FENCE_TIMEOUT_MS	1000
++#define SUN4I_MP_MIN_TIMEOUT_MS		100
++/* a timeout per pixel well below the slowest measured rate (57 Mpix/s) */
++#define SUN4I_MP_PIXELS_PER_MS		10000
++/*
++ * About 64 ms of copying at the measured 131 Mpix/s (four 1080p copies);
++ * keeps one caller from holding the engine and the DRAM bus for long.
++ */
++#define SUN4I_MP_MAX_BATCH_PIXELS	BIT_ULL(23)
++/* reset pulse and settle times, as used by the verified /dev/mem tests */
++#define SUN4I_MP_RESET_US		50
++
++/* MP sees DRAM at bus address 0 */
++#ifdef CONFIG_ARM
++#define SUN4I_MP_DRAM_BASE		PHYS_OFFSET
++#else
++#define SUN4I_MP_DRAM_BASE		0	/* COMPILE_TEST only */
++#endif
++
++static bool allow_overlap;
++module_param(allow_overlap, bool, 0644);
++MODULE_PARM_DESC(allow_overlap,
++		 "Allow overlapping copies inside one buffer (bottom-up scan, untested)");
++
++static unsigned int timeout_ms;
++module_param(timeout_ms, uint, 0600);
++MODULE_PARM_DESC(timeout_ms,
++		 "Per-rectangle timeout in ms, 0 = by size (debug: forces the recovery path)");
++
++struct sun4i_mp {
++	struct drm_device drm;
++	void __iomem *regs;
++	struct clk *ahb_clk;
++	struct clk *mod_clk;
++	struct clk *ram_clk;
++	struct reset_control *rst;
++	/* serialises all use of the engine registers */
++	struct mutex lock;
++	struct completion done;
++	u32 irq_status;
++	int irq;
++	/* the engine did not stop after a reset: never start it again */
++	bool wedged;
++};
++
++/* a validated surface */
++struct sun4i_mp_surf {
++	u64 base;	/* bus address of pixel (0, 0) */
++	u32 pitch;
++	u32 width;
++	u32 height;
++	bool opaque;	/* XRGB8888: the alpha byte is not valid */
++};
++
++enum sun4i_mp_scan {
++	SUN4I_MP_SCAN_NORMAL,
++	SUN4I_MP_SCAN_BOTTOM_UP,
++	SUN4I_MP_SCAN_SKIP,
++};
++
++static const u16 sun4i_mp_csc01_coef[12] = {
++	0x04a7, 0x1e6f, 0x1cbf, 0x0877, 0x04a7, 0x0000,
++	0x0662, 0x3211, 0x04a7, 0x0812, 0x0000, 0x2eb1,
++};
++
++static const u16 sun4i_mp_csc2_coef[12] = {
++	0x0204, 0x0107, 0x0064, 0x0100, 0x1ed6, 0x1f69,
++	0x01c1, 0x0800, 0x1e87, 0x01c1, 0x1fb8, 0x0800,
++};
++
++/* used for both the horizontal (0x200) and the vertical (0x280) filter */
++static const u32 sun4i_mp_scaler_coef[32] = {
++	0x00004000, 0x000140ff, 0x00033ffe, 0x00043ffd,
++	0x00063efc, 0xff083dfc, 0x000a3bfb, 0xff0d39fb,
++	0xff0f37fb, 0xff1136fa, 0xfe1433fb, 0xfe1631fb,
++	0xfd192ffb, 0xfd1c2cfb, 0xfd1f29fb, 0xfc2127fc,
++	0xfc2424fc, 0xfc2721fc, 0xfb291ffd, 0xfb2c1cfd,
++	0xfb2f19fd, 0xfb3116fe, 0xfb3314fe, 0xfa3611ff,
++	0xfb370fff, 0xfb390dff, 0xfb3b0a00, 0xfc3d08ff,
++	0xfc3e0600, 0xfd3f0400, 0xfe3f0300, 0xff400100,
++};
++
++static inline struct sun4i_mp *to_sun4i_mp(struct drm_device *drm)
++{
++	return container_of(drm, struct sun4i_mp, drm);
++}
++
++static inline void sun4i_mp_write(struct sun4i_mp *mp, u32 reg, u32 val)
++{
++	writel_relaxed(val, mp->regs + reg);
++}
++
++/* Clear the job registers and load the coefficient RAM (mixer_reg_init()) */
++static void sun4i_mp_hw_init(struct sun4i_mp *mp)
++{
++	unsigned int i;
++
++	for (i = MP_CTL; i <= MP_OALPHA_CTL; i += 4)
++		sun4i_mp_write(mp, i, 0);
++	sun4i_mp_write(mp, MP_STS, MP_STS_FINISH | MP_STS_ERR);
++
++	for (i = 0; i < ARRAY_SIZE(sun4i_mp_csc01_coef); i++)
++		sun4i_mp_write(mp, MP_CSC01_COEF + 4 * i,
++			       sun4i_mp_csc01_coef[i] << 16 |
++			       sun4i_mp_csc01_coef[i]);
++	for (i = 0; i < ARRAY_SIZE(sun4i_mp_csc2_coef); i++)
++		sun4i_mp_write(mp, MP_CSC2_COEF + 4 * i, sun4i_mp_csc2_coef[i]);
++	for (i = 0; i < 2 * ARRAY_SIZE(sun4i_mp_scaler_coef); i++)
++		sun4i_mp_write(mp, MP_SCALER_COEF + 4 * i,
++			       sun4i_mp_scaler_coef[i % ARRAY_SIZE(sun4i_mp_scaler_coef)]);
++}
++
++/*
++ * Stop the engine after a timeout or an error. A master that is still
++ * running must not outlive the ioctl (the buffers may be freed right
++ * after it), so the module is reset even if it does not go idle.
++ */
++static void sun4i_mp_recover(struct sun4i_mp *mp)
++{
++	u32 sts;
++
++	writel(0, mp->regs + MP_CTL);
++	if (readl_poll_timeout(mp->regs + MP_STS, sts, !(sts & MP_STS_BUSY),
++			       10, 20000))
++		drm_err(&mp->drm, "engine still busy (STS %08x), resetting it\n",
++			sts);
++
++	reset_control_assert(mp->rst);
++	udelay(SUN4I_MP_RESET_US);
++	reset_control_deassert(mp->rst);
++	udelay(SUN4I_MP_RESET_US);
++
++	sts = readl(mp->regs + MP_STS);
++	if (sts & MP_STS_BUSY) {
++		mp->wedged = true;
++		/* never gate the clocks of a master that may still run */
++		pm_runtime_get_noresume(mp->drm.dev);
++		drm_err(&mp->drm,
++			"engine busy after reset (STS %08x), disabled until reboot\n",
++			sts);
++		return;
++	}
++	sun4i_mp_hw_init(mp);
++
++	/* a late interrupt of this job must not complete the next one */
++	synchronize_irq(mp->irq);
++}
++
++static irqreturn_t sun4i_mp_irq(int irq, void *data)
++{
++	struct sun4i_mp *mp = data;
++	u32 sts = readl(mp->regs + MP_STS);
++
++	if (!(sts & (MP_STS_FINISH | MP_STS_ERR)))
++		return IRQ_NONE;
++
++	/*
++	 * Only acknowledge: the engine is disabled (CTL = 0) once BUSY has
++	 * dropped, as the verified /dev/mem sequence does.
++	 */
++	writel(MP_STS_FINISH | MP_STS_ERR, mp->regs + MP_STS);
++
++	WRITE_ONCE(mp->irq_status, sts);
++	complete(&mp->done);
++
++	return IRQ_HANDLED;
++}
++
++static int sun4i_mp_run(struct sun4i_mp *mp, u64 pixels)
++{
++	unsigned long timeout;
++	u32 sts;
++
++	/* pixels is at most SUN4I_MP_MAX_BATCH_PIXELS, so this fits */
++	if (READ_ONCE(timeout_ms))
++		timeout = msecs_to_jiffies(READ_ONCE(timeout_ms));
++	else
++		timeout = msecs_to_jiffies(max_t(u32, SUN4I_MP_MIN_TIMEOUT_MS,
++						 div_u64(pixels, SUN4I_MP_PIXELS_PER_MS)));
++
++	reinit_completion(&mp->done);
++	WRITE_ONCE(mp->irq_status, 0);
++
++	/* writel() orders the relaxed register writes before the start */
++	writel(MP_STS_FINISH | MP_STS_ERR, mp->regs + MP_STS);
++	writel(0, mp->regs + MP_CTL);
++	writel(MP_CTL_EN | MP_CTL_START | MP_CTL_FINISH_IRQ_EN |
++	       MP_CTL_ERR_IRQ_EN, mp->regs + MP_CTL);
++
++	if (wait_for_completion_timeout(&mp->done, timeout)) {
++		sts = READ_ONCE(mp->irq_status);
++	} else {
++		sts = readl(mp->regs + MP_STS);
++		if (!(sts & (MP_STS_FINISH | MP_STS_ERR))) {
++			drm_err_ratelimited(&mp->drm,
++					    "timeout after %u ms, STS %08x CTL %08x\n",
++					    jiffies_to_msecs(timeout), sts,
++					    readl(mp->regs + MP_CTL));
++			sun4i_mp_recover(mp);
++			return -ETIMEDOUT;
++		}
++		/* finished, but the interrupt never arrived */
++		drm_warn_once(&mp->drm, "completion interrupt lost, STS %08x\n",
++			      sts);
++		writel(MP_STS_FINISH | MP_STS_ERR, mp->regs + MP_STS);
++		synchronize_irq(mp->irq);
++	}
++
++	if (sts & (MP_STS_ERR | MP_STS_HWERR)) {
++		drm_err_ratelimited(&mp->drm, "engine error, STS %08x\n", sts);
++		sun4i_mp_recover(mp);
++		return -EIO;
++	}
++
++	/* let the last lines leave the engine before the buffers are released */
++	if (readl_poll_timeout(mp->regs + MP_STS, sts, !(sts & MP_STS_BUSY),
++			       0, 1000)) {
++		drm_err_ratelimited(&mp->drm, "busy after finish, STS %08x\n",
++				    sts);
++		sun4i_mp_recover(mp);
++		return -EIO;
++	}
++	writel(0, mp->regs + MP_CTL);
++
++	return 0;
++}
++
++static u64 sun4i_mp_bitaddr(const struct sun4i_mp_surf *s, u32 x, u32 y)
++{
++	/* all MP addresses and line widths are in bits */
++	return (s->base + (u64)y * s->pitch + (u64)x * 4) * 8;
++}
++
++/* Point input DMA channel @ch at (@x, @y) of @s; returns its HADDR bits */
++static u32 sun4i_mp_set_input(struct sun4i_mp *mp, unsigned int ch,
++			      const struct sun4i_mp_surf *s, u32 x, u32 y,
++			      u32 size)
++{
++	u64 addr = sun4i_mp_bitaddr(s, x, y);
++	u32 ctl = MP_DMA_CTL_EN;	/* ARGB8888, normal sequence */
++
++	if (s->opaque)
++		ctl |= MP_DMA_CTL_GLOBAL_ALPHA(0xff) | MP_DMA_CTL_ALPHA_GLOBAL;
++
++	sun4i_mp_write(mp, MP_DMA_LADDR(ch), lower_32_bits(addr));
++	sun4i_mp_write(mp, MP_DMA_STRIDE(ch), s->pitch * 8);
++	sun4i_mp_write(mp, MP_DMA_SIZE(ch), size);
++	sun4i_mp_write(mp, MP_DMA_CTL(ch), ctl);
++
++	return MP_DMA_HADDR_CH(ch, addr);
++}
++
++static void sun4i_mp_program(struct sun4i_mp *mp, u32 op, u32 fill_color,
++			     const struct sun4i_mp_surf *src,
++			     const struct sun4i_mp_surf *dst,
++			     const struct drm_sun4i_mp_rect *r,
++			     enum sun4i_mp_scan scan)
++{
++	u32 size = MP_SIZE(r->width, r->height);
++	u32 out_y = r->dst_y;
++	u32 haddr = 0;
++	u64 out;
++	u32 reg;
++
++	for (reg = MP_CTL; reg <= MP_OALPHA_CTL; reg += 4)
++		sun4i_mp_write(mp, reg, 0);
++
++	if (scan == SUN4I_MP_SCAN_BOTTOM_UP) {
++		/* the output starts at the bottom line (mixer_simple_blt()) */
++		sun4i_mp_write(mp, MP_SCAN, MP_SCAN_BOTTOM_UP);
++		out_y += r->height - 1;
++	}
++
++	switch (op) {
++	case DRM_SUN4I_MP_OP_FILL:
++		sun4i_mp_write(mp, MP_DMA_SIZE(0), size);
++		sun4i_mp_write(mp, MP_DMA_CTL(0),
++			       MP_DMA_CTL_EN | MP_DMA_CTL_FILL_EN);
++		sun4i_mp_write(mp, MP_DMA_FILL(0), fill_color);
++		/* ROP output = ch0 | ch1 | ch2, with ch1/ch2 filled with 0 */
++		sun4i_mp_write(mp, MP_ROP_IDX0, MP_ROP_IDX0_OR);
++		break;
++	case DRM_SUN4I_MP_OP_BLEND:
++		haddr |= sun4i_mp_set_input(mp, SUN4I_MP_DST_CH, dst,
++					    r->dst_x, r->dst_y, size);
++		sun4i_mp_write(mp, MP_CK_CTL, MP_CK_CTL_ALPHA_EN);
++		sun4i_mp_write(mp, MP_OALPHA_CTL, MP_OALPHA_CTL_BLEND);
++		fallthrough;
++	case DRM_SUN4I_MP_OP_COPY:
++		haddr |= sun4i_mp_set_input(mp, SUN4I_MP_SRC_CH, src,
++					    r->src_x, r->src_y, size);
++		/* ROP output = ch0 & ch1 & ch2, with ch1/ch2 filled with ~0 */
++		sun4i_mp_write(mp, MP_DMA_FILL(1), 0xffffffff);
++		sun4i_mp_write(mp, MP_DMA_FILL(2), 0xffffffff);
++		sun4i_mp_write(mp, MP_DMA_HADDR, haddr);
++		break;
++	}
++
++	out = sun4i_mp_bitaddr(dst, r->dst_x, out_y);
++	sun4i_mp_write(mp, MP_OUT_SIZE, size);
++	sun4i_mp_write(mp, MP_OUT_HADDR, upper_32_bits(out) & 0xf);
++	sun4i_mp_write(mp, MP_OUT_LADDR0, lower_32_bits(out));
++	sun4i_mp_write(mp, MP_OUT_STRIDE0, dst->pitch * 8);
++	sun4i_mp_write(mp, MP_OUT_CTL, MP_OUT_CTL_ARGB8888);
++}
++
++static int sun4i_mp_check_surface(struct drm_device *drm,
++				  const struct drm_sun4i_mp_surface *s,
++				  struct drm_gem_object *obj,
++				  struct sun4i_mp_surf *out)
++{
++	struct drm_gem_dma_object *dma_obj = to_drm_gem_dma_obj(obj);
++	u64 end;
++
++	if (s->format != DRM_FORMAT_ARGB8888 &&
++	    s->format != DRM_FORMAT_XRGB8888) {
++		drm_dbg(drm, "unsupported format %p4cc\n", &s->format);
++		return -EINVAL;
++	}
++
++	if (!s->width || !s->height ||
++	    s->width > DRM_SUN4I_MP_MAX_SURFACE_SIZE ||
++	    s->height > DRM_SUN4I_MP_MAX_SURFACE_SIZE ||
++	    !IS_ALIGNED(s->pitch, 4) || !IS_ALIGNED(s->offset, 4) ||
++	    (u64)s->width * 4 > s->pitch || s->pitch > U32_MAX / 8) {
++		drm_dbg(drm, "bad surface %ux%u pitch %u offset %u\n",
++			s->width, s->height, s->pitch, s->offset);
++		return -EINVAL;
++	}
++
++	end = (u64)s->offset + (u64)s->pitch * (s->height - 1) +
++	      (u64)s->width * 4;
++	if (end > obj->size) {
++		drm_dbg(drm, "surface ends at %llu, object size %zu\n",
++			end, obj->size);
++		return -EINVAL;
++	}
++
++	/* bit addresses are 36 bits wide, the DMA mask is 32 bits anyway */
++	if ((u64)dma_obj->dma_addr + obj->size > SZ_4G)
++		return -EINVAL;
++
++	/*
++	 * Belt and braces against a missing MBUS offset, where MP would
++	 * write PHYS_OFFSET away from the buffer: the bus address must be
++	 * the CPU physical address minus the DRAM base.
++	 */
++	if (!dma_obj->sgt || !sg_page(dma_obj->sgt->sgl) ||
++	    sg_phys(dma_obj->sgt->sgl) - SUN4I_MP_DRAM_BASE != dma_obj->dma_addr) {
++		drm_err_once(drm, "buffer bus address %pad not DRAM-relative\n",
++			     &dma_obj->dma_addr);
++		return -EINVAL;
++	}
++
++	out->base = (u64)dma_obj->dma_addr + s->offset;
++	out->pitch = s->pitch;
++	out->width = s->width;
++	out->height = s->height;
++	out->opaque = s->format == DRM_FORMAT_XRGB8888;
++
++	return 0;
++}
++
++static bool sun4i_mp_rect_fits(const struct sun4i_mp_surf *s, u32 x, u32 y,
++			       u32 w, u32 h)
++{
++	return (u64)x + w <= s->width && (u64)y + h <= s->height;
++}
++
++static bool sun4i_mp_ranges_overlap(u64 a, u64 alen, u64 b, u64 blen)
++{
++	return a < b + blen && b < a + alen;
++}
++
++/*
++ * Validate @r and choose the scan order. Source and destination may only
++ * overlap for a copy inside one surface, and only in the directions the
++ * engine can scan (it has no working right-to-left mode).
++ */
++static int sun4i_mp_classify(struct drm_device *drm, u32 op,
++			     const struct sun4i_mp_surf *src,
++			     const struct sun4i_mp_surf *dst,
++			     const struct drm_sun4i_mp_rect *r, bool overlap_ok)
++{
++	u64 s_start, d_start, s_len, d_len;
++
++	if (!r->width || !r->height ||
++	    r->width > DRM_SUN4I_MP_MAX_RECT_SIZE ||
++	    r->height > DRM_SUN4I_MP_MAX_RECT_SIZE ||
++	    !sun4i_mp_rect_fits(dst, r->dst_x, r->dst_y, r->width, r->height))
++		goto bad;
++
++	if (op == DRM_SUN4I_MP_OP_FILL) {
++		if (r->src_x || r->src_y)
++			goto bad;
++		return SUN4I_MP_SCAN_NORMAL;
++	}
++
++	if (!sun4i_mp_rect_fits(src, r->src_x, r->src_y, r->width, r->height))
++		goto bad;
++
++	/* byte spans, including the gaps between the lines */
++	s_start = src->base + (u64)r->src_y * src->pitch + (u64)r->src_x * 4;
++	s_len = (u64)(r->height - 1) * src->pitch + (u64)r->width * 4;
++	d_start = dst->base + (u64)r->dst_y * dst->pitch + (u64)r->dst_x * 4;
++	d_len = (u64)(r->height - 1) * dst->pitch + (u64)r->width * 4;
++	if (!sun4i_mp_ranges_overlap(s_start, s_len, d_start, d_len))
++		return SUN4I_MP_SCAN_NORMAL;
++
++	if (src->base != dst->base || src->pitch != dst->pitch) {
++		drm_dbg(drm, "overlapping surfaces with different geometry\n");
++		return -EINVAL;
++	}
++
++	/* same surface: disjoint pixel sets need no particular order */
++	if (!sun4i_mp_ranges_overlap(r->src_x, r->width, r->dst_x, r->width) ||
++	    !sun4i_mp_ranges_overlap(r->src_y, r->height, r->dst_y, r->height))
++		return SUN4I_MP_SCAN_NORMAL;
++
++	/* a copy onto itself is a no-op unless it sets the alpha (XRGB src) */
++	if (r->src_x == r->dst_x && r->src_y == r->dst_y &&
++	    op == DRM_SUN4I_MP_OP_COPY && !src->opaque)
++		return SUN4I_MP_SCAN_SKIP;
++
++	if (op != DRM_SUN4I_MP_OP_COPY || !overlap_ok ||
++	    (r->dst_y == r->src_y && r->dst_x > r->src_x)) {
++		drm_dbg(drm, "unsupported overlapping blit\n");
++		return -EINVAL;
++	}
++
++	return r->dst_y > r->src_y ? SUN4I_MP_SCAN_BOTTOM_UP :
++				     SUN4I_MP_SCAN_NORMAL;
++
++bad:
++	drm_dbg(drm, "bad rect %ux%u dst %u,%u src %u,%u\n", r->width,
++		r->height, r->dst_x, r->dst_y, r->src_x, r->src_y);
++	return -EINVAL;
++}
++
++static int sun4i_mp_wait_resv(struct drm_gem_object *obj,
++			      enum dma_resv_usage usage)
++{
++	long ret;
++
++	ret = dma_resv_wait_timeout(obj->resv, usage, true,
++				    msecs_to_jiffies(SUN4I_MP_FENCE_TIMEOUT_MS));
++	if (ret < 0)
++		return ret;
++	return ret ? 0 : -ETIMEDOUT;
++}
++
++static int sun4i_mp_ioctl_blit(struct drm_device *drm, void *data,
++			       struct drm_file *file)
++{
++	static const struct drm_sun4i_mp_surface no_surface;
++	struct drm_sun4i_mp_blit *args = data;
++	struct sun4i_mp *mp = to_sun4i_mp(drm);
++	struct drm_gem_object *src_obj = NULL, *dst_obj;
++	struct sun4i_mp_surf src = {}, dst;
++	struct drm_sun4i_mp_rect *rects;
++	bool overlap_ok = READ_ONCE(allow_overlap);
++	u64 pixels = 0;
++	unsigned int i;
++	int idx, ret;
++
++	args->num_done = 0;
++	if (args->flags || args->pad || args->op > DRM_SUN4I_MP_OP_BLEND ||
++	    !args->num_rects || args->num_rects > DRM_SUN4I_MP_MAX_RECTS)
++		return -EINVAL;
++
++	if (args->op == DRM_SUN4I_MP_OP_FILL) {
++		if (memcmp(&args->src, &no_surface, sizeof(no_surface)))
++			return -EINVAL;
++	} else if (args->fill_color) {
++		return -EINVAL;
++	}
++
++	rects = memdup_array_user(u64_to_user_ptr(args->rects),
++				  args->num_rects, sizeof(*rects));
++	if (IS_ERR(rects))
++		return PTR_ERR(rects);
++
++	dst_obj = drm_gem_object_lookup(file, args->dst.handle);
++	if (!dst_obj) {
++		ret = -ENOENT;
++		goto out_free;
++	}
++	ret = sun4i_mp_check_surface(drm, &args->dst, dst_obj, &dst);
++	if (ret)
++		goto out_put;
++
++	if (args->op != DRM_SUN4I_MP_OP_FILL) {
++		src_obj = drm_gem_object_lookup(file, args->src.handle);
++		if (!src_obj) {
++			ret = -ENOENT;
++			goto out_put;
++		}
++		ret = sun4i_mp_check_surface(drm, &args->src, src_obj, &src);
++		if (ret)
++			goto out_put;
++	}
++
++	for (i = 0; i < args->num_rects; i++) {
++		ret = sun4i_mp_classify(drm, args->op, &src, &dst, &rects[i],
++					overlap_ok);
++		if (ret < 0)
++			goto out_put;
++		pixels += (u64)rects[i].width * rects[i].height;
++	}
++	if (pixels > SUN4I_MP_MAX_BATCH_PIXELS) {
++		ret = -EINVAL;
++		goto out_put;
++	}
++
++	/* implicit sync: pending writers of src, all users of dst */
++	if (src_obj) {
++		ret = sun4i_mp_wait_resv(src_obj, DMA_RESV_USAGE_WRITE);
++		if (ret)
++			goto out_put;
++	}
++	ret = sun4i_mp_wait_resv(dst_obj, DMA_RESV_USAGE_READ);
++	if (ret)
++		goto out_put;
++
++	if (!drm_dev_enter(drm, &idx)) {
++		ret = -ENODEV;
++		goto out_put;
++	}
++
++	ret = pm_runtime_resume_and_get(drm->dev);
++	if (ret)
++		goto out_exit;
++
++	ret = mutex_lock_interruptible(&mp->lock);
++	if (ret)
++		goto out_pm;
++
++	if (mp->wedged) {
++		ret = -EIO;
++		goto out_unlock;
++	}
++
++	/* from here on the batch is never restarted after a signal */
++	for (i = 0; i < args->num_rects; i++) {
++		const struct drm_sun4i_mp_rect *r = &rects[i];
++		int scan;
++
++		scan = sun4i_mp_classify(drm, args->op, &src, &dst, r,
++					 overlap_ok);
++		if (scan != SUN4I_MP_SCAN_SKIP) {
++			sun4i_mp_program(mp, args->op, args->fill_color, &src,
++					 &dst, r, scan);
++			ret = sun4i_mp_run(mp, (u64)r->width * r->height);
++			if (ret)
++				break;
++		}
++		args->num_done = i + 1;
++	}
++
++out_unlock:
++	mutex_unlock(&mp->lock);
++out_pm:
++	pm_runtime_put_autosuspend(drm->dev);
++out_exit:
++	drm_dev_exit(idx);
++out_put:
++	drm_gem_object_put(src_obj);
++	drm_gem_object_put(dst_obj);
++out_free:
++	kfree(rects);
++	return ret;
++}
++
++static const struct drm_ioctl_desc sun4i_mp_ioctls[] = {
++	DRM_IOCTL_DEF_DRV(SUN4I_MP_BLIT, sun4i_mp_ioctl_blit, DRM_RENDER_ALLOW),
++};
++
++DEFINE_DRM_GEM_FOPS(sun4i_mp_fops);
++
++/*
++ * GEM objects only come from PRIME imports. The DMA helper rejects any
++ * dma-buf that is not contiguous in our device's DMA address space, and
++ * the mapping is made for this device, so it carries the MBUS offset.
++ */
++static const struct drm_driver sun4i_mp_drm_driver = {
++	.driver_features		= DRIVER_GEM | DRIVER_RENDER,
++	.gem_prime_import_sg_table	= drm_gem_dma_prime_import_sg_table,
++	.ioctls				= sun4i_mp_ioctls,
++	.num_ioctls			= ARRAY_SIZE(sun4i_mp_ioctls),
++	.fops				= &sun4i_mp_fops,
++	.name				= "sun4i-mp",
++	.desc				= "Allwinner A20 Mixer Processor",
++	.major				= 1,
++	.minor				= 0,
++};
++
++static int sun4i_mp_runtime_suspend(struct device *dev)
++{
++	struct sun4i_mp *mp = dev_get_drvdata(dev);
++
++	disable_irq(mp->irq);
++	clk_disable_unprepare(mp->ram_clk);
++	clk_disable_unprepare(mp->mod_clk);
++	clk_disable_unprepare(mp->ahb_clk);
++	reset_control_assert(mp->rst);
++
++	return 0;
++}
++
++static int sun4i_mp_runtime_resume(struct device *dev)
++{
++	struct sun4i_mp *mp = dev_get_drvdata(dev);
++	int ret;
++
++	ret = reset_control_deassert(mp->rst);
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(mp->ahb_clk);
++	if (ret)
++		goto err_rst;
++	ret = clk_prepare_enable(mp->mod_clk);
++	if (ret)
++		goto err_ahb;
++	ret = clk_prepare_enable(mp->ram_clk);
++	if (ret)
++		goto err_mod;
++
++	udelay(SUN4I_MP_RESET_US);
++	sun4i_mp_hw_init(mp);
++	/* the line is only enabled while the registers are accessible */
++	enable_irq(mp->irq);
++
++	return 0;
++
++err_mod:
++	clk_disable_unprepare(mp->mod_clk);
++err_ahb:
++	clk_disable_unprepare(mp->ahb_clk);
++err_rst:
++	reset_control_assert(mp->rst);
++	return ret;
++}
++
++static int sun4i_mp_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct sun4i_mp *mp;
++	unsigned long rate;
++	int irq, ret;
++
++	/*
++	 * MP is an MBUS master and sees DRAM at bus address 0. Without the
++	 * DMA offset from sunxi_mbus every address would be off by
++	 * PHYS_OFFSET, so never touch the engine without it.
++	 */
++	if (!dev->dma_range_map ||
++	    dev->dma_range_map->cpu_start != SUN4I_MP_DRAM_BASE ||
++	    dev->dma_range_map->dma_start != 0)
++		return dev_err_probe(dev, -EINVAL,
++				     "no MBUS DMA offset for this device\n");
++
++	mp = devm_drm_dev_alloc(dev, &sun4i_mp_drm_driver, struct sun4i_mp,
++				drm);
++	if (IS_ERR(mp))
++		return PTR_ERR(mp);
++	platform_set_drvdata(pdev, mp);
++
++	ret = devm_mutex_init(dev, &mp->lock);
++	if (ret)
++		return ret;
++	init_completion(&mp->done);
++
++	mp->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(mp->regs))
++		return PTR_ERR(mp->regs);
++
++	mp->ahb_clk = devm_clk_get(dev, "ahb");
++	if (IS_ERR(mp->ahb_clk))
++		return dev_err_probe(dev, PTR_ERR(mp->ahb_clk),
++				     "failed to get the ahb clock\n");
++	mp->mod_clk = devm_clk_get(dev, "mod");
++	if (IS_ERR(mp->mod_clk))
++		return dev_err_probe(dev, PTR_ERR(mp->mod_clk),
++				     "failed to get the mod clock\n");
++	mp->ram_clk = devm_clk_get(dev, "ram");
++	if (IS_ERR(mp->ram_clk))
++		return dev_err_probe(dev, PTR_ERR(mp->ram_clk),
++				     "failed to get the ram clock\n");
++
++	mp->rst = devm_reset_control_get_exclusive(dev, NULL);
++	if (IS_ERR(mp->rst))
++		return dev_err_probe(dev, PTR_ERR(mp->rst),
++				     "failed to get the reset line\n");
++
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++
++	/* the DT normally sets parent and rate; never run from a fast PLL */
++	rate = clk_get_rate(mp->mod_clk);
++	if (rate > SUN4I_MP_MAX_RATE) {
++		ret = clk_set_rate(mp->mod_clk, SUN4I_MP_DEFAULT_RATE);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "failed to set the clock rate\n");
++		rate = clk_get_rate(mp->mod_clk);
++		if (rate > SUN4I_MP_MAX_RATE)
++			return dev_err_probe(dev, -EINVAL,
++					     "clock rate %lu Hz too high\n",
++					     rate);
++	}
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++	mp->irq = irq;
++	ret = devm_request_irq(dev, irq, sun4i_mp_irq, IRQF_NO_AUTOEN,
++			       dev_name(dev), mp);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to request the IRQ\n");
++
++	pm_runtime_set_autosuspend_delay(dev, SUN4I_MP_AUTOSUSPEND_MS);
++	pm_runtime_use_autosuspend(dev);
++	pm_runtime_enable(dev);
++
++	ret = drm_dev_register(&mp->drm, 0);
++	if (ret)
++		goto err_pm;
++
++	drm_info(&mp->drm, "mixer processor at %lu MHz\n", rate / 1000000);
++
++	return 0;
++
++err_pm:
++	pm_runtime_dont_use_autosuspend(dev);
++	pm_runtime_disable(dev);
++	return ret;
++}
++
++static void sun4i_mp_remove(struct platform_device *pdev)
++{
++	struct sun4i_mp *mp = platform_get_drvdata(pdev);
++	struct device *dev = &pdev->dev;
++
++	/* waits for running ioctls, later ones fail with -ENODEV */
++	drm_dev_unplug(&mp->drm);
++
++	pm_runtime_dont_use_autosuspend(dev);
++	pm_runtime_disable(dev);
++	if (!pm_runtime_status_suspended(dev))
++		sun4i_mp_runtime_suspend(dev);
++	pm_runtime_set_suspended(dev);
++}
++
++static DEFINE_RUNTIME_DEV_PM_OPS(sun4i_mp_pm_ops, sun4i_mp_runtime_suspend,
++				 sun4i_mp_runtime_resume, NULL);
++
++static const struct of_device_id sun4i_mp_of_match[] = {
++	{ .compatible = "allwinner,sun4i-a10-mixer-processor" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sun4i_mp_of_match);
++
++static struct platform_driver sun4i_mp_driver = {
++	.probe = sun4i_mp_probe,
++	.remove = sun4i_mp_remove,
++	.driver = {
++		.name = "sun4i-mp",
++		.of_match_table = sun4i_mp_of_match,
++		.pm = pm_ptr(&sun4i_mp_pm_ops),
++	},
++};
++module_platform_driver(sun4i_mp_driver);
++
++MODULE_AUTHOR("D.R.racer <drracer@seznam.cz>");
++MODULE_DESCRIPTION("Allwinner A20 Mixer Processor (2D engine) driver");
++MODULE_LICENSE("GPL");
+diff --git a/include/uapi/drm/sun4i_mp_drm.h b/include/uapi/drm/sun4i_mp_drm.h
+new file mode 100644
+index 000000000..fe5e0528d
+--- /dev/null
++++ b/include/uapi/drm/sun4i_mp_drm.h
+@@ -0,0 +1,117 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Allwinner A20 mixer processor (G2D) user space interface
++ *
++ * Copyright (C) 2026 D.R.racer <drracer@seznam.cz>
++ */
++
++#ifndef _SUN4I_MP_DRM_H_
++#define _SUN4I_MP_DRM_H_
++
++#include "drm.h"
++
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
++#define DRM_SUN4I_MP_BLIT		0x00
++
++#define DRM_IOCTL_SUN4I_MP_BLIT \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_SUN4I_MP_BLIT, struct drm_sun4i_mp_blit)
++
++/* dst = src; from an XRGB8888 source the alpha channel is set to 0xff */
++#define DRM_SUN4I_MP_OP_COPY		0
++/* dst = fill_color */
++#define DRM_SUN4I_MP_OP_FILL		1
++/*
++ * Non-premultiplied source-over:
++ *   dst.rgb = src.rgb * src.a + dst.rgb * (1 - src.a)
++ *   dst.a   = src.a + dst.a * (1 - src.a)
++ * XRGB8888 surfaces count as opaque.
++ */
++#define DRM_SUN4I_MP_OP_BLEND		2
++
++#define DRM_SUN4I_MP_MAX_RECTS		256
++#define DRM_SUN4I_MP_MAX_RECT_SIZE	8192
++#define DRM_SUN4I_MP_MAX_SURFACE_SIZE	65535
++
++/**
++ * struct drm_sun4i_mp_surface - a linear 32 bpp image inside a GEM object
++ * @handle: GEM handle of a PRIME-imported, physically contiguous buffer
++ * @format: DRM_FORMAT_ARGB8888 or DRM_FORMAT_XRGB8888 (linear layout)
++ * @width: width in pixels, 1..DRM_SUN4I_MP_MAX_SURFACE_SIZE
++ * @height: height in pixels, 1..DRM_SUN4I_MP_MAX_SURFACE_SIZE
++ * @pitch: bytes per line, a multiple of 4, at least @width * 4
++ * @offset: byte offset of pixel (0, 0) in the object, a multiple of 4
++ *
++ * The whole surface must lie inside the GEM object.
++ */
++struct drm_sun4i_mp_surface {
++	__u32 handle;
++	__u32 format;
++	__u32 width;
++	__u32 height;
++	__u32 pitch;
++	__u32 offset;
++};
++
++/**
++ * struct drm_sun4i_mp_rect - one engine operation
++ * @dst_x: left edge in the destination surface
++ * @dst_y: top edge in the destination surface
++ * @src_x: left edge in the source surface (must be 0 for FILL)
++ * @src_y: top edge in the source surface (must be 0 for FILL)
++ * @width: 1..DRM_SUN4I_MP_MAX_RECT_SIZE
++ * @height: 1..DRM_SUN4I_MP_MAX_RECT_SIZE
++ */
++struct drm_sun4i_mp_rect {
++	__u32 dst_x;
++	__u32 dst_y;
++	__u32 src_x;
++	__u32 src_y;
++	__u32 width;
++	__u32 height;
++};
++
++/**
++ * struct drm_sun4i_mp_blit - DRM_IOCTL_SUN4I_MP_BLIT argument
++ * @op: DRM_SUN4I_MP_OP_*
++ * @flags: must be 0
++ * @src: source surface; all fields 0 for DRM_SUN4I_MP_OP_FILL
++ * @dst: destination surface
++ * @fill_color: ARGB8888 colour for DRM_SUN4I_MP_OP_FILL, otherwise 0
++ * @num_rects: number of entries in @rects, 1..DRM_SUN4I_MP_MAX_RECTS
++ * @rects: user pointer to an array of struct drm_sun4i_mp_rect
++ * @num_done: out: number of leading rectangles that were executed
++ * @pad: must be 0
++ *
++ * The ioctl is synchronous. It waits for the pending implicit fences
++ * (writers of @src, all users of @dst), then runs the rectangles in array
++ * order and returns once the engine is idle again. Nothing is done if any
++ * argument is invalid (-EINVAL). After an engine error or timeout (-EIO,
++ * -ETIMEDOUT) @num_done tells how many rectangles were completed; this
++ * matters for BLEND, which must not be applied twice. Overlapping source
++ * and destination areas are rejected with -EINVAL unless the driver allows
++ * them (module parameter allow_overlap).
++ *
++ * The engine does no CPU cache maintenance: buffers must be write-combined
++ * or uncached in every CPU mapping (as sun4i-drm dumb/scanout buffers are),
++ * and CPU writes must be complete before the ioctl.
++ */
++struct drm_sun4i_mp_blit {
++	__u32 op;
++	__u32 flags;
++	struct drm_sun4i_mp_surface src;
++	struct drm_sun4i_mp_surface dst;
++	__u32 fill_color;
++	__u32 num_rects;
++	__u64 rects;
++	__u32 num_done;
++	__u32 pad;
++};
++
++#if defined(__cplusplus)
++}
++#endif
++
++#endif /* _SUN4I_MP_DRM_H_ */
+-- 
+2.55.0
+

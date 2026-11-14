@@ -1,0 +1,933 @@
+Description: glamor: offload copies to the A20 G2D (sun4i-mp DRM driver)
+ Copies between pixmaps backed by physically contiguous dma-bufs (the scanout
+ front buffer, DRI3 client buffers from kmsro) are done by the Allwinner A20
+ mixer processor through DRM_IOCTL_SUN4I_MP_BLIT instead of a Mali job.
+ Everything else falls back to the unchanged GL path. Enabled when a render
+ node named "sun4i-mp" exists; XSERVER_G2D=0 or Option "G2DAccel" "off"
+ disables it.
+Author: D.R.racer <drracer@seznam.cz>
+Forwarded: not-needed
+Last-Update: 2026-10-20
+Assisted-by: Claude:claude-opus-5-5
+---
+Index: xorg-server/glamor/glamor_copy.c
+===================================================================
+--- xorg-server.orig/glamor/glamor_copy.c
++++ xorg-server/glamor/glamor_copy.c
+@@ -735,9 +735,21 @@ glamor_copy(DrawablePtr src,
+             Pixel bitplane,
+             void *closure)
+ {
++    glamor_screen_private *glamor_priv = glamor_get_screen_private(dst->pScreen);
++
+     if (nbox == 0)
+ 	return;
+ 
++    if (glamor_priv->g2d_copy) {
++        int done = glamor_priv->g2d_copy(src, dst, gc, box, nbox, dx, dy,
++                                         bitplane);
++
++        if (done >= nbox)
++            return;
++        box += done;
++        nbox -= done;
++    }
++
+     if (glamor_copy_gl(src, dst, gc, box, nbox, dx, dy, reverse, upsidedown, bitplane, closure))
+         return;
+     glamor_copy_bail(src, dst, gc, box, nbox, dx, dy, reverse, upsidedown, bitplane, closure);
+Index: xorg-server/glamor/glamor_egl.c
+===================================================================
+--- xorg-server.orig/glamor/glamor_egl.c
++++ xorg-server/glamor/glamor_egl.c
+@@ -167,6 +167,7 @@ glamor_egl_set_pixmap_image(PixmapPtr pi
+         glamor_get_pixmap_private(pixmap);
+     EGLImageKHR old;
+ 
++    glamor_g2d_pixmap_release(pixmap);
+     old = pixmap_priv->image;
+     if (old) {
+         ScreenPtr                               screen = pixmap->drawable.pScreen;
+@@ -732,6 +733,7 @@ glamor_egl_destroy_pixmap(PixmapPtr pixm
+         struct glamor_pixmap_private *pixmap_priv =
+             glamor_get_pixmap_private(pixmap);
+ 
++        glamor_g2d_pixmap_release(pixmap);
+         if (pixmap_priv->image)
+             eglDestroyImageKHR(glamor_egl->display, pixmap_priv->image);
+     }
+@@ -754,6 +756,8 @@ glamor_egl_exchange_buffers(PixmapPtr fr
+     struct glamor_pixmap_private *back_priv =
+         glamor_get_pixmap_private(back);
+ 
++    glamor_g2d_pixmap_release(front);
++    glamor_g2d_pixmap_release(back);
+     glamor_pixmap_exchange_fbos(front, back);
+ 
+     temp_img = back_priv->image;
+@@ -780,6 +784,7 @@ glamor_egl_close_screen(ScreenPtr screen
+     screen_pixmap = screen->GetScreenPixmap(screen);
+     pixmap_priv = glamor_get_pixmap_private(screen_pixmap);
+ 
++    glamor_g2d_close_screen(screen);
+     eglDestroyImageKHR(glamor_egl->display, pixmap_priv->image);
+     pixmap_priv->image = NULL;
+ 
+@@ -872,6 +877,8 @@ glamor_egl_screen_init(ScreenPtr screen,
+ 
+     glamor_ctx->make_current = glamor_egl_make_current;
+ 
++    glamor_g2d_screen_init(screen);
++
+ #ifdef DRI3
+     /* Tell the core that we have the interfaces for import/export
+      * of pixmaps.
+Index: xorg-server/glamor/glamor_g2d.c
+===================================================================
+--- /dev/null
++++ xorg-server/glamor/glamor_g2d.c
+@@ -0,0 +1,766 @@
++/*
++ * Copyright © 2026 D.R.racer <drracer@seznam.cz>
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ */
++
++/*
++ * Offload of glamor copies (Present copies, CopyArea, CopyWindow) to the
++ * Allwinner A20 mixer processor ("G2D") through the render-only DRM driver
++ * "sun4i-mp".
++ *
++ * Only pixmaps that are backed by a physically contiguous dma-buf qualify:
++ * the scanout front buffer and DRI3/exported pixmaps whose GBM buffer the
++ * display driver allocated. The kernel refuses to import anything else, and
++ * that answer is cached per pixmap. Everything that is not handled here
++ * falls through to the GL path.
++ *
++ * Synchronisation: pending glamor GL work is flushed before the blit, the
++ * ioctl waits for the implicit fences of both buffers and returns only after
++ * the engine has finished, so later GL work on either buffer is ordered after
++ * the blit without any extra fence.
++ */
++
++#include "dix-config.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <xf86.h>
++#include <xf86drm.h>
++#include <gbm.h>
++#include <drm_fourcc.h>
++
++#include "list.h"
++#include "glamor_priv.h"
++
++/* uAPI of the sun4i-mp driver (include/uapi/drm/sun4i_mp_drm.h, MIT) */
++#ifndef DRM_IOCTL_SUN4I_MP_BLIT
++#define DRM_SUN4I_MP_BLIT               0x00
++#define DRM_SUN4I_MP_OP_COPY            0
++#define DRM_SUN4I_MP_MAX_RECTS          256
++#define DRM_SUN4I_MP_MAX_RECT_SIZE      8192
++
++struct drm_sun4i_mp_surface {
++    __u32 handle;
++    __u32 format;
++    __u32 width;
++    __u32 height;
++    __u32 pitch;
++    __u32 offset;
++};
++
++struct drm_sun4i_mp_rect {
++    __u32 dst_x;
++    __u32 dst_y;
++    __u32 src_x;
++    __u32 src_y;
++    __u32 width;
++    __u32 height;
++};
++
++struct drm_sun4i_mp_blit {
++    __u32 op;
++    __u32 flags;
++    struct drm_sun4i_mp_surface src;
++    struct drm_sun4i_mp_surface dst;
++    __u32 fill_color;
++    __u32 num_rects;
++    __u64 rects;
++    __u32 num_done;
++    __u32 pad;
++};
++
++#define DRM_IOCTL_SUN4I_MP_BLIT \
++    DRM_IOWR(DRM_COMMAND_BASE + DRM_SUN4I_MP_BLIT, struct drm_sun4i_mp_blit)
++#endif
++
++/* kernel limit on the pixels of one ioctl */
++#define G2D_MAX_BATCH_PIXELS    (1u << 23)
++#define G2D_REPORT_MS           10000
++#define G2D_MAX_HW_ERRORS       3       /* EIO in a row: engine broken */
++#define G2D_MAX_TIMEOUTS        3       /* ETIMEDOUT in a row: each one stalled X ~1 s */
++#define G2D_MAX_ERRORS          16      /* any other failure in a row */
++#define G2D_OVERLAP_PARAM       "/sys/module/sun4i_mp/parameters/allow_overlap"
++
++struct g2d_handle_ref {
++    uint32_t handle;
++    unsigned int refs;
++};
++
++/* per-pixmap state, glamor_pixmap_private.g2d */
++struct g2d_pixmap {
++    struct xorg_list link;
++    PixmapPtr pixmap;
++    Bool ok;                    /* FALSE: not importable, use GL */
++    uint32_t handle;
++    uint32_t pitch;
++    uint32_t offset;
++    int fd;                     /* dma-buf, kept only for the busy poll */
++};
++
++struct g2d_stats {
++    uint64_t calls, done, ioctls, rects, pixels;
++    uint64_t fb_ineligible, fb_small, fb_import, fb_overlap, fb_busy;
++    uint64_t fb_error, partial;
++};
++
++struct g2d_batch {
++    struct drm_sun4i_mp_blit blit;
++    struct drm_sun4i_mp_rect rects[DRM_SUN4I_MP_MAX_RECTS];
++    int box_of[DRM_SUN4I_MP_MAX_RECTS];   /* index of the box a rect came from */
++    unsigned int n;
++    uint64_t pixels;
++};
++
++/* per-screen state, glamor_screen_private.g2d */
++struct g2d_screen {
++    int fd;
++    int scrn_index;
++    Bool disabled;
++    Bool overlap_ok;            /* module parameter allow_overlap */
++    Bool overlap_refused;       /* the kernel refused one anyway: stop trying */
++    Bool busy_fallback;
++    unsigned int min_pixels;
++    unsigned int hw_errors;
++    unsigned int timeouts;
++    unsigned int errors;
++    CARD32 last_tick;
++    struct g2d_handle_ref *handles;
++    unsigned int nhandles, handles_size;
++    struct xorg_list pixmaps;
++    struct g2d_stats st;
++    struct g2d_batch batch;     /* scratch for glamor_g2d_copy() */
++};
++
++static Bool
++g2d_read_overlap_param(void)
++{
++    char c = 'N';
++    int fd = open(G2D_OVERLAP_PARAM, O_RDONLY | O_CLOEXEC);
++
++    if (fd < 0)
++        return FALSE;
++    if (read(fd, &c, 1) != 1)
++        c = 'N';
++    close(fd);
++    return c == 'Y' || c == 'y' || c == '1';
++}
++
++static int
++g2d_open_device(char *path, size_t len)
++{
++    int i;
++
++    for (i = 128; i < 192; i++) {
++        drmVersionPtr v;
++        int fd;
++
++        snprintf(path, len, "%s/renderD%d", DRM_DIR_NAME, i);
++        fd = open(path, O_RDWR | O_CLOEXEC);
++        if (fd < 0)
++            continue;
++        v = drmGetVersion(fd);
++        if (v && v->name && strcmp(v->name, "sun4i-mp") == 0) {
++            drmFreeVersion(v);
++            return fd;
++        }
++        if (v)
++            drmFreeVersion(v);
++        close(fd);
++    }
++    return -1;
++}
++
++/*
++ * A dma-buf imported twice into one DRM file gives the same GEM handle, so
++ * two pixmaps on one buffer share it. Close it only with its last user.
++ */
++static Bool
++g2d_handle_ref(struct g2d_screen *g, uint32_t handle)
++{
++    unsigned int i;
++
++    for (i = 0; i < g->nhandles; i++) {
++        if (g->handles[i].handle == handle) {
++            g->handles[i].refs++;
++            return TRUE;
++        }
++    }
++    if (g->nhandles == g->handles_size) {
++        unsigned int n = g->handles_size ? g->handles_size * 2 : 16;
++        struct g2d_handle_ref *h = reallocarray(g->handles, n, sizeof(*h));
++
++        if (!h)
++            return FALSE;
++        g->handles = h;
++        g->handles_size = n;
++    }
++    g->handles[g->nhandles].handle = handle;
++    g->handles[g->nhandles].refs = 1;
++    g->nhandles++;
++    return TRUE;
++}
++
++static void
++g2d_handle_close(struct g2d_screen *g, uint32_t handle)
++{
++    struct drm_gem_close c = { .handle = handle };
++
++    drmIoctl(g->fd, DRM_IOCTL_GEM_CLOSE, &c);
++}
++
++static void
++g2d_handle_unref(struct g2d_screen *g, uint32_t handle)
++{
++    unsigned int i;
++
++    for (i = 0; i < g->nhandles; i++) {
++        if (g->handles[i].handle != handle)
++            continue;
++        if (--g->handles[i].refs == 0) {
++            g2d_handle_close(g, handle);
++            g->handles[i] = g->handles[--g->nhandles];
++        }
++        return;
++    }
++}
++
++static void
++g2d_pixmap_import(struct g2d_screen *g, PixmapPtr pixmap,
++                  glamor_pixmap_private *priv, struct g2d_pixmap *gp)
++{
++    struct gbm_device *gbm = glamor_egl_get_gbm_device(pixmap->drawable.pScreen);
++    struct gbm_bo *bo;
++    uint32_t handle;
++    int fd;
++
++    bo = gbm_bo_import(gbm, GBM_BO_IMPORT_EGL_IMAGE, priv->image, 0);
++    if (!bo)
++        return;
++
++#ifdef GBM_BO_WITH_MODIFIERS
++    {
++        uint64_t modifier = gbm_bo_get_modifier(bo);
++
++        if (gbm_bo_get_plane_count(bo) != 1 ||
++            (modifier != DRM_FORMAT_MOD_LINEAR &&
++             modifier != DRM_FORMAT_MOD_INVALID))
++            goto out;
++        gp->offset = gbm_bo_get_offset(bo, 0);
++    }
++#endif
++    gp->pitch = gbm_bo_get_stride(bo);
++
++    fd = gbm_bo_get_fd(bo);
++    if (fd < 0)
++        goto out;
++
++    /* -EINVAL here means "not physically contiguous" (lima shmem etc.) */
++    if (drmPrimeFDToHandle(g->fd, fd, &handle)) {
++        LogMessageVerb(X_INFO, 5, "G2D: pixmap %dx%d not importable: %s\n",
++                       pixmap->drawable.width, pixmap->drawable.height,
++                       strerror(errno));
++        close(fd);
++        goto out;
++    }
++    if (!g2d_handle_ref(g, handle)) {
++        /* not in the table: nobody else can be using this handle */
++        g2d_handle_close(g, handle);
++        close(fd);
++        goto out;
++    }
++
++    if (g->busy_fallback)
++        gp->fd = fd;
++    else
++        close(fd);
++    gp->handle = handle;
++    gp->ok = TRUE;
++out:
++    gbm_bo_destroy(bo);
++}
++
++static struct g2d_pixmap *
++g2d_pixmap_get(struct g2d_screen *g, PixmapPtr pixmap)
++{
++    glamor_pixmap_private *priv = glamor_get_pixmap_private(pixmap);
++    struct g2d_pixmap *gp;
++
++    if (!priv)
++        return NULL;
++    if (priv->g2d)
++        return priv->g2d;
++    /* textures glamor allocated itself are never contiguous dma-bufs */
++    if (!priv->image)
++        return NULL;
++
++    gp = calloc(1, sizeof(*gp));
++    if (!gp)
++        return NULL;
++    gp->pixmap = pixmap;
++    gp->fd = -1;
++    xorg_list_add(&gp->link, &g->pixmaps);
++    priv->g2d = gp;
++
++    g2d_pixmap_import(g, pixmap, priv, gp);
++    return gp;
++}
++
++static void
++g2d_pixmap_free(struct g2d_screen *g, struct g2d_pixmap *gp)
++{
++    glamor_pixmap_private *priv = glamor_get_pixmap_private(gp->pixmap);
++
++    if (gp->ok)
++        g2d_handle_unref(g, gp->handle);
++    if (gp->fd >= 0)
++        close(gp->fd);
++    xorg_list_del(&gp->link);
++    priv->g2d = NULL;
++    free(gp);
++}
++
++/*
++ * Called whenever the storage behind a pixmap goes away or changes
++ * (destroy, new EGLImage, buffer exchange).
++ */
++void
++glamor_g2d_pixmap_release(PixmapPtr pixmap)
++{
++    glamor_screen_private *glamor_priv =
++        glamor_get_screen_private(pixmap->drawable.pScreen);
++    glamor_pixmap_private *priv = glamor_get_pixmap_private(pixmap);
++
++    if (!glamor_priv || !glamor_priv->g2d || !priv || !priv->g2d)
++        return;
++    g2d_pixmap_free(glamor_priv->g2d, priv->g2d);
++}
++
++static void
++g2d_log_stats(struct g2d_screen *g, MessageType type, int verb)
++{
++    struct g2d_stats *s = &g->st;
++
++    LogMessageVerb(type, verb,
++                   "G2D: %llu copies (of %llu calls), %llu ioctls, %llu rects, "
++                   "%llu Mpix; to GL: %llu ineligible, %llu small, "
++                   "%llu not importable, %llu overlap, %llu busy, "
++                   "%llu errors (%llu partial)\n",
++                   (unsigned long long) s->done, (unsigned long long) s->calls,
++                   (unsigned long long) s->ioctls,
++                   (unsigned long long) s->rects,
++                   (unsigned long long) (s->pixels / 1000000),
++                   (unsigned long long) s->fb_ineligible,
++                   (unsigned long long) s->fb_small,
++                   (unsigned long long) s->fb_import,
++                   (unsigned long long) s->fb_overlap,
++                   (unsigned long long) s->fb_busy,
++                   (unsigned long long) s->fb_error,
++                   (unsigned long long) s->partial);
++}
++
++static void
++g2d_tick(struct g2d_screen *g)
++{
++    CARD32 now = GetTimeInMillis();
++
++    if ((CARD32) (now - g->last_tick) < G2D_REPORT_MS)
++        return;
++    g->last_tick = now;
++    /* the parameter is runtime-writable: follow it */
++    g->overlap_ok = g2d_read_overlap_param();
++    if (xf86GetVerbosity() >= 4)
++        g2d_log_stats(g, X_INFO, 4);
++}
++
++
++/*
++ * Run the queued rects. Returns -1 on success, otherwise the index of the
++ * first box that is not complete.
++ */
++static int
++g2d_submit(struct g2d_screen *g, struct g2d_batch *b, Bool same_buffer)
++{
++    int err;
++
++    if (!b->n)
++        return -1;
++
++    b->blit.num_rects = b->n;
++    b->blit.rects = (uintptr_t) b->rects;
++    b->blit.num_done = 0;
++    g->st.ioctls++;
++
++    if (drmIoctl(g->fd, DRM_IOCTL_SUN4I_MP_BLIT, &b->blit) == 0) {
++        g->st.rects += b->n;
++        g->st.pixels += b->pixels;
++        g->hw_errors = 0;
++        g->timeouts = 0;
++        g->errors = 0;
++        b->n = 0;
++        b->pixels = 0;
++        return -1;
++    }
++
++    err = errno;
++    g->st.fb_error++;
++    if (err == EINVAL && same_buffer && g->overlap_ok && !g->overlap_refused) {
++        /* the kernel refused an overlap we expected it to take */
++        g->overlap_refused = TRUE;
++        LogMessageVerb(X_WARNING, 1,
++                       "G2D: overlapping copy refused by the kernel, "
++                       "using GL for those\n");
++    } else {
++        /*
++         * EIO: engine error. ETIMEDOUT: engine timeout, or a GPU job on one
++         * of the buffers still running after the kernel's fence timeout.
++         * ENODEV: device gone. Anything else is unexpected.
++         */
++        LogMessageVerb(X_WARNING, 1, "G2D: blit failed: %s\n", strerror(err));
++        if ((err == EIO && ++g->hw_errors >= G2D_MAX_HW_ERRORS) ||
++            (err == ETIMEDOUT && ++g->timeouts >= G2D_MAX_TIMEOUTS) ||
++            err == ENODEV || ++g->errors >= G2D_MAX_ERRORS) {
++            g->disabled = TRUE;
++            xf86DrvMsg(g->scrn_index, X_ERROR,
++                       "G2D: disabled after repeated failures (last: %s)\n",
++                       strerror(err));
++        }
++    }
++
++    if (b->blit.num_done > b->n)
++        b->blit.num_done = 0;   /* not written back: assume nothing done */
++    if (b->blit.num_done == b->n)
++        return b->box_of[b->n - 1] + 1;
++    return b->box_of[b->blit.num_done];
++}
++
++/*
++ * Returns how many leading boxes have been copied; the caller does the rest
++ * with GL. Boxes are in dst drawable coordinates, the source of a box is the
++ * box moved by (dx, dy) in src drawable coordinates. For copies inside one
++ * buffer, miDoCopy/miCopyRegion order the boxes for a sequential copy only
++ * when src and dst are the same drawable or both windows (other multi-box
++ * same-buffer calls go to GL below); the engine runs the rects in
++ * array order, so overlapping copies only need the per-rect scan direction,
++ * which the kernel picks (or refuses).
++ */
++static int
++glamor_g2d_copy(DrawablePtr src, DrawablePtr dst, GCPtr gc,
++                BoxPtr box, int nbox, int dx, int dy, Pixel bitplane)
++{
++    glamor_screen_private *glamor_priv = glamor_get_screen_private(dst->pScreen);
++    struct g2d_screen *g = glamor_priv->g2d;
++    PixmapPtr sp = glamor_get_drawable_pixmap(src);
++    PixmapPtr dp = glamor_get_drawable_pixmap(dst);
++    struct g2d_pixmap *sg, *dg;
++    struct g2d_batch *b;
++    int soff_x, soff_y, doff_x, doff_y;
++    int ddx, ddy, sw, sh, dw, dh;
++    uint64_t area = 0;
++    Bool same_buffer;
++    int i, failed = -1;
++
++    if (!g || g->disabled)
++        return 0;
++    if (nbox <= 0)
++        return 0;
++    g2d_tick(g);
++    g->st.calls++;
++
++    if (bitplane ||
++        (gc && (gc->alu != GXcopy ||
++                !glamor_pm_is_solid(gc->depth, gc->planemask))) ||
++        sp->drawable.bitsPerPixel != 32 || dp->drawable.bitsPerPixel != 32 ||
++        sp->drawable.depth != dp->drawable.depth ||
++        (dp->drawable.depth != 24 && dp->drawable.depth != 32)) {
++        g->st.fb_ineligible++;
++        return 0;
++    }
++
++    for (i = 0; i < nbox; i++)
++        area += (uint64_t) (box[i].x2 - box[i].x1) * (box[i].y2 - box[i].y1);
++    if (area < g->min_pixels) {
++        g->st.fb_small++;
++        return 0;
++    }
++
++    sg = g2d_pixmap_get(g, sp);
++    dg = g2d_pixmap_get(g, dp);
++    if (!sg || !dg) {
++        g->st.fb_ineligible++;
++        return 0;
++    }
++    if (!sg->ok || !dg->ok) {
++        g->st.fb_import++;
++        return 0;
++    }
++
++    glamor_get_drawable_deltas(src, sp, &soff_x, &soff_y);
++    glamor_get_drawable_deltas(dst, dp, &doff_x, &doff_y);
++    /* src pixel = dst pixel + (ddx, ddy), both in pixmap coordinates */
++    ddx = dx + soff_x - doff_x;
++    ddy = dy + soff_y - doff_y;
++    sw = sp->drawable.width;
++    sh = sp->drawable.height;
++    dw = dp->drawable.width;
++    dh = dp->drawable.height;
++
++    same_buffer = sg->handle == dg->handle;
++    if (same_buffer) {
++        if (sg->offset != dg->offset || sg->pitch != dg->pitch) {
++            g->st.fb_ineligible++;
++            return 0;
++        }
++        if (ddx == 0 && ddy == 0) {
++            /* a copy onto itself: a no-op for depth 32; depth 24 (sets
++             * alpha) is left to GL */
++            if (dp->drawable.depth == 24) {
++                g->st.fb_overlap++;
++                return 0;
++            }
++            g->st.done++;
++            return nbox;
++        }
++        /*
++         * miDoCopy/miCopyRegion order the boxes for a sequential copy only
++         * when src and dst are the same drawable or both windows. Any other
++         * caller with several boxes on one buffer (glamor_composite's copy
++         * shortcut, a window and a pixmap sharing storage) goes to GL, which
++         * does not depend on the order.
++         */
++        if (nbox > 1 && src != dst &&
++            !(src->type == DRAWABLE_WINDOW && dst->type == DRAWABLE_WINDOW)) {
++            g->st.fb_overlap++;
++            return 0;
++        }
++        /* mirror the kernel's rule, so known refusals cost no ioctl */
++        for (i = 0; i < nbox; i++) {
++            if (abs(ddx) < box[i].x2 - box[i].x1 &&
++                abs(ddy) < box[i].y2 - box[i].y1 &&
++                (!g->overlap_ok || g->overlap_refused ||
++                 (ddy == 0 && ddx < 0))) {
++                g->st.fb_overlap++;
++                return 0;
++            }
++        }
++    }
++
++    for (i = 0; i < nbox; i++) {
++        uint64_t px = (uint64_t) (box[i].x2 - box[i].x1) *
++            (box[i].y2 - box[i].y1);
++
++        /*
++         * Boxes wider than the engine, and (inside one buffer) boxes that
++         * would need splitting into strips: a failure after some strips
++         * could not be redone by GL. Never happens with Mali-400's 4096
++         * texture limit and a 3.4 Mpix front buffer.
++         */
++        if (box[i].x2 - box[i].x1 > DRM_SUN4I_MP_MAX_RECT_SIZE ||
++            (same_buffer && px > G2D_MAX_BATCH_PIXELS)) {
++            g->st.fb_ineligible++;
++            return 0;
++        }
++    }
++
++    /* do not stall the X main loop on a client frame still being rendered */
++    if (g->busy_fallback && sg->fd >= 0) {
++        struct pollfd p = { .fd = sg->fd, .events = POLLIN };
++
++        if (poll(&p, 1, 0) != 1) {
++            g->st.fb_busy++;
++            return 0;
++        }
++    }
++
++    b = &g->batch;
++    b->n = 0;
++    b->pixels = 0;
++
++    /*
++     * Equal depths. Depth 32: raw ARGB copy. Depth 24: XRGB source, so the
++     * engine writes alpha 0xff (the X byte is undefined in X; glamor makes
++     * depth-24 buffers ARGB8888, and other importers then see them opaque).
++     */
++    b->blit.op = DRM_SUN4I_MP_OP_COPY;
++    b->blit.src = (struct drm_sun4i_mp_surface) {
++        .handle = sg->handle,
++        .format = dp->drawable.depth == 24 ? DRM_FORMAT_XRGB8888 :
++                                             DRM_FORMAT_ARGB8888,
++        .width = sw, .height = sh, .pitch = sg->pitch, .offset = sg->offset,
++    };
++    b->blit.dst = (struct drm_sun4i_mp_surface) {
++        .handle = dg->handle, .format = DRM_FORMAT_ARGB8888,
++        .width = dw, .height = dh, .pitch = dg->pitch, .offset = dg->offset,
++    };
++
++    /* submit everything GL has queued, its fences are what the kernel waits on */
++    glamor_make_current(glamor_priv);
++    glFlush();
++
++    for (i = 0; i < nbox && failed < 0; i++) {
++        /* dst rect in dst pixmap coordinates, clipped to both surfaces */
++        int x1 = max(max(box[i].x1 + doff_x, 0), -ddx);
++        int y1 = max(max(box[i].y1 + doff_y, 0), -ddy);
++        int x2 = min(min(box[i].x2 + doff_x, dw), sw - ddx);
++        int y2 = min(min(box[i].y2 + doff_y, dh), sh - ddy);
++        int w = x2 - x1, h = y2 - y1, rows, y, step;
++
++        if (w <= 0 || h <= 0)
++            continue;
++
++        /*
++         * Split boxes beyond the per-ioctl pixel budget into strips. A copy
++         * downwards inside one buffer must start with the bottom strip.
++         */
++        rows = min((int) (G2D_MAX_BATCH_PIXELS / w), DRM_SUN4I_MP_MAX_RECT_SIZE);
++        step = (same_buffer && ddy < 0) ? -1 : 1;
++        for (y = step > 0 ? y1 : y2 - min(rows, h); failed < 0;) {
++            int y_end = min(y + rows, y2);
++            int ys = max(y, y1);
++            int hs = y_end - ys;
++            struct drm_sun4i_mp_rect *r;
++
++            if (hs > 0) {
++                if (b->n == DRM_SUN4I_MP_MAX_RECTS ||
++                    b->pixels + (uint64_t) w * hs > G2D_MAX_BATCH_PIXELS)
++                    failed = g2d_submit(g, b, same_buffer);
++                if (failed >= 0)
++                    break;
++                r = &b->rects[b->n];
++                r->dst_x = x1;
++                r->dst_y = ys;
++                r->src_x = x1 + ddx;
++                r->src_y = ys + ddy;
++                r->width = w;
++                r->height = hs;
++                b->box_of[b->n] = i;
++                b->n++;
++                b->pixels += (uint64_t) w * hs;
++            }
++            if (step > 0) {
++                y += rows;
++                if (y >= y2)
++                    break;
++            } else {
++                if (y <= y1)
++                    break;
++                y -= rows;
++            }
++        }
++    }
++    if (failed < 0)
++        failed = g2d_submit(g, b, same_buffer);
++
++    if (failed >= 0) {
++        if (failed > 0)
++            g->st.partial++;
++        return failed;
++    }
++    g->st.done++;
++    return nbox;
++}
++
++void
++glamor_g2d_screen_init(ScreenPtr screen)
++{
++    ScrnInfoPtr scrn = xf86ScreenToScrn(screen);
++    glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
++    struct g2d_screen *g;
++    const char *env = getenv("XSERVER_G2D");
++    char path[64];
++    char *busy;
++    int fd;
++
++    if (!glamor_priv)
++        return;
++    if (env && strcmp(env, "0") == 0) {
++        xf86DrvMsg(scrn->scrnIndex, X_CONFIG,
++                   "G2D: disabled by XSERVER_G2D=0\n");
++        return;
++    }
++    if (!xf86SetBoolOption(scrn->options, "G2DAccel", TRUE)) {
++        xf86DrvMsg(scrn->scrnIndex, X_CONFIG,
++                   "G2D: disabled by option G2DAccel\n");
++        return;
++    }
++
++    fd = g2d_open_device(path, sizeof(path));
++    if (fd < 0) {
++        xf86DrvMsg(scrn->scrnIndex, X_INFO,
++                   "G2D: no accessible sun4i-mp render node\n");
++        return;
++    }
++
++    g = calloc(1, sizeof(*g));
++    if (!g) {
++        close(fd);
++        return;
++    }
++    g->fd = fd;
++    g->scrn_index = scrn->scrnIndex;
++    g->overlap_ok = g2d_read_overlap_param();
++    g->last_tick = GetTimeInMillis();
++    xorg_list_init(&g->pixmaps);
++
++    g->min_pixels = xf86SetIntOption(scrn->options, "G2DMinPixels", 4096);
++    env = getenv("XSERVER_G2D_MIN_PIXELS");
++    if (env)
++        g->min_pixels = strtoul(env, NULL, 0);
++
++    busy = xf86SetStrOption(scrn->options, "G2DBusySource", "wait");
++    env = getenv("XSERVER_G2D_BUSY");
++    g->busy_fallback = strcmp(env ? env : busy ? busy : "wait", "gl") == 0;
++    free(busy);
++
++    glamor_priv->g2d = g;
++    glamor_priv->g2d_copy = glamor_g2d_copy;
++
++    xf86DrvMsg(scrn->scrnIndex, X_INFO,
++               "G2D: enabled on %s (allow_overlap %s, min %u px, "
++               "busy source: %s)\n", path, g->overlap_ok ? "Y" : "N",
++               g->min_pixels, g->busy_fallback ? "gl" : "wait");
++}
++
++void
++glamor_g2d_close_screen(ScreenPtr screen)
++{
++    glamor_screen_private *glamor_priv = glamor_get_screen_private(screen);
++    struct g2d_screen *g = glamor_priv ? glamor_priv->g2d : NULL;
++    struct g2d_pixmap *gp, *tmp;
++
++    if (!g)
++        return;
++
++    xorg_list_for_each_entry_safe(gp, tmp, &g->pixmaps, link)
++        g2d_pixmap_free(g, gp);
++
++    g2d_log_stats(g, X_INFO, 0);
++    glamor_priv->g2d_copy = NULL;
++    glamor_priv->g2d = NULL;
++    close(g->fd);
++    free(g->handles);
++    free(g);
++}
+Index: xorg-server/glamor/glamor_priv.h
+===================================================================
+--- xorg-server.orig/glamor/glamor_priv.h
++++ xorg-server/glamor/glamor_priv.h
+@@ -318,6 +318,12 @@ typedef struct glamor_screen_private {
+     glamor_program xv_prog;
+ 
+     struct glamor_context ctx;
++
++    /* G2D copy offload (glamor_g2d.c), set up by glamor_egl when available.
++     * g2d_copy returns how many leading boxes it copied. */
++    int (*g2d_copy)(DrawablePtr src, DrawablePtr dst, GCPtr gc,
++                    BoxPtr box, int nbox, int dx, int dy, Pixel bitplane);
++    void *g2d;
+ } glamor_screen_private;
+ 
+ typedef enum glamor_access {
+@@ -404,6 +410,9 @@ typedef struct glamor_pixmap_private {
+     glamor_pixmap_fbo **fbo_array;
+ 
+     Bool is_cbcr;
++
++    /* G2D import state of the dma-buf behind image (glamor_g2d.c) */
++    void *g2d;
+ } glamor_pixmap_private;
+ 
+ extern DevPrivateKeyRec glamor_pixmap_private_key;
+@@ -550,6 +559,13 @@ extern int glamor_debug_level;
+ /* glamor.c */
+ PixmapPtr glamor_get_drawable_pixmap(DrawablePtr drawable);
+ 
++#ifdef GLAMOR_HAS_GBM
++/* glamor_g2d.c (built into glamoregl) */
++void glamor_g2d_screen_init(ScreenPtr screen);
++void glamor_g2d_close_screen(ScreenPtr screen);
++void glamor_g2d_pixmap_release(PixmapPtr pixmap);
++#endif
++
+ glamor_pixmap_fbo *glamor_pixmap_detach_fbo(glamor_pixmap_private *
+                                             pixmap_priv);
+ void glamor_pixmap_attach_fbo(PixmapPtr pixmap, glamor_pixmap_fbo *fbo);
+Index: xorg-server/hw/xfree86/glamor_egl/Makefile.am
+===================================================================
+--- xorg-server.orig/hw/xfree86/glamor_egl/Makefile.am
++++ xorg-server/hw/xfree86/glamor_egl/Makefile.am
+@@ -24,12 +24,14 @@ module_LTLIBRARIES = libglamoregl.la
+ libglamoregl_la_SOURCES = \
+ 	$(top_srcdir)/glamor/glamor_egl.c \
+ 	$(top_srcdir)/glamor/glamor_eglmodule.c \
++	$(top_srcdir)/glamor/glamor_g2d.c \
+ 	glamor_xf86_xv.c \
+ 	$()
+ 
+ libglamoregl_la_LDFLAGS = \
+ 	-avoid-version \
+ 	$(GBM_LIBS) \
++	$(LIBDRM_LIBS) \
+ 	$()
+ 
+ libglamoregl_la_LIBADD = \
+@@ -41,4 +43,4 @@ AM_CPPFLAGS = $(XORG_INCS) \
+ 	-I$(top_srcdir)/glamor \
+ 	$()
+ 
+-AM_CFLAGS = $(DIX_CFLAGS) $(XORG_CFLAGS) $(GLAMOR_CFLAGS) $(GBM_CFLAGS)
++AM_CFLAGS = $(DIX_CFLAGS) $(XORG_CFLAGS) $(GLAMOR_CFLAGS) $(GBM_CFLAGS) $(LIBDRM_CFLAGS)
+Index: xorg-server/hw/xfree86/glamor_egl/meson.build
+===================================================================
+--- xorg-server.orig/hw/xfree86/glamor_egl/meson.build
++++ xorg-server/hw/xfree86/glamor_egl/meson.build
+@@ -1,6 +1,7 @@
+ glamoregl_src = [
+     '../../../glamor/glamor_egl.c',
+     '../../../glamor/glamor_eglmodule.c',
++    '../../../glamor/glamor_g2d.c',
+     'glamor_xf86_xv.c',
+ ]
+ 

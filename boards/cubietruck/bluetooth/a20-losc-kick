@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 D.R.racer
+# Restart the A20 32 kHz crystal after it has stopped. Under heavy load (CPU/GPU) the crystal sometimes stops and the
+# RTC falls back to its internal RC oscillator (LOSC_CTRL bit 13 set, RTC ~3.5 % slow); by itself the hardware only
+# returns to the crystal after minutes. Rewriting the crystal setting restarts it within ~7-15 s once the disturbance
+# is gone. Kicks after DOWN_S on RC, then again with a growing pause (up to MAX_S) while it stays down. Never writes
+# while an RTC time/date write is pending (bits 7/8, which rtc-sunxi's settime waits for; systohc every 11 min).
+# Bluetooth is not affected by a running crystal stopping (the AP6210 samples its LPO at power-up only, see
+# cubietruck-bt); this keeps the RTC accurate and the crystal ready for the next BT power-up.
+# Background: README.md next to this script
+import mmap, os, struct, time
+
+KEY = 0x16aa0000               # rewrites the current drive strength (GSM) with the external crystal selected
+DOWN_S, MAX_S, POLL_S = 30, 600, 1
+DRY = os.environ.get("KICK") == "0"     # log only, for experiments that need the natural recovery
+
+fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+m = mmap.mmap(fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=0x01c20000)
+losc = lambda: struct.unpack_from("<I", m, 0xd00)[0]
+
+def log(msg):
+    print(msg, flush=True)
+
+down_since, next_kick, pause, kicks, last_kick = None, 0.0, DOWN_S, 0, None
+while True:
+    now = time.monotonic()
+    v = losc()
+    if v & 0x2000:
+        if down_since is None:
+            down_since, next_kick, pause, kicks = now, now + DOWN_S, DOWN_S, 0
+            log("crystal stopped, RTC on the RC oscillator")
+        elif now >= next_kick and not v & 0x180:
+            if not DRY:
+                struct.pack_into("<I", m, 0xd00, KEY | (v & 0xc) | 1)
+            last_kick = now
+            kicks += 1
+            pause = min(pause * 2, MAX_S)
+            next_kick = now + pause
+            log(f"{'would kick' if DRY else 'kick'} {kicks} after {now - down_since:.0f} s on RC")
+    elif down_since is not None:
+        since = f", {now - last_kick:.1f} s after the last kick" if kicks else ""
+        log(f"crystal running again after {now - down_since:.0f} s, {kicks} kick(s){since}")
+        down_since = None
+    time.sleep(POLL_S)

@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Fri, 30 Oct 2026 23:05:26 +0100
+Subject: [PATCH] dmabuf-feedback: offer scan-out-only formats in scanout
+ tranches
+
+The scanout tranche is the intersection of the KMS plane formats and the
+renderer formats, so a format/modifier pair that only the display engine
+supports (Allwinner A10/A20: NV12 ALLWINNER_TILED, the video engine's
+decoder output; lima cannot sample it) is never advertised, and clients
+cannot know that direct scan-out of their buffers would work.
+
+Offer all plane format/modifier pairs in the scanout tranche, appending
+the pairs the renderer does not support to the format table. Buffers
+allocated with them are accepted as direct-display buffers.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ libweston/backend-drm/drm.c | 20 +++++---------------
+ libweston/linux-dmabuf.c    | 35 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 40 insertions(+), 15 deletions(-)
+
+diff --git a/libweston/backend-drm/drm.c b/libweston/backend-drm/drm.c
+index 11a5c3d..50a8f72 100644
+--- a/libweston/backend-drm/drm.c
++++ b/libweston/backend-drm/drm.c
+@@ -2161,17 +2161,10 @@ drm_output_deinit_planes(struct drm_output *output)
+ static struct weston_drm_format_array *
+ get_scanout_formats(struct drm_device *device)
+ {
+-	struct weston_compositor *ec = device->backend->compositor;
+-	const struct weston_drm_format_array *renderer_formats;
+ 	struct weston_drm_format_array *scanout_formats, union_planes_formats;
+ 	struct drm_plane *plane;
+ 	int ret;
+ 
+-	/* If we got here it means that dma-buf feedback is supported and that
+-	 * the renderer has formats/modifiers to expose. */
+-	assert(ec->renderer->get_supported_formats != NULL);
+-	renderer_formats = ec->renderer->get_supported_formats(ec);
+-
+ 	scanout_formats = zalloc(sizeof(*scanout_formats));
+ 	if (!scanout_formats) {
+ 		weston_log("%s: out of memory\n", __func__);
+@@ -2195,15 +2188,12 @@ get_scanout_formats(struct drm_device *device)
+ 			goto err;
+ 	}
+ 
+-	/* Compute the intersection between the union of format/modifiers of KMS
+-	 * planes and the formats supported by the renderer */
++	/* The scanout formats are the format/modifiers of the KMS planes. The
++	 * pairs the renderer cannot import are scan-out-only: such buffers are
++	 * accepted as direct-display buffers (see linux-dmabuf.c), which
++	 * lets e.g. a video decoder's tiled output reach a plane. */
+ 	ret = weston_drm_format_array_replace(scanout_formats,
+-					      renderer_formats);
+-	if (ret < 0)
+-		goto err;
+-
+-	ret = weston_drm_format_array_intersect(scanout_formats,
+-						&union_planes_formats);
++					      &union_planes_formats);
+ 	if (ret < 0)
+ 		goto err;
+ 
+diff --git a/libweston/linux-dmabuf.c b/libweston/linux-dmabuf.c
+index 45609f3..9b358ab 100644
+--- a/libweston/linux-dmabuf.c
++++ b/libweston/linux-dmabuf.c
+@@ -615,6 +615,35 @@ format_table_get_format_index(struct weston_dmabuf_feedback_format_table *format
+ 	return -1;
+ }
+ 
++/* Appends a format/modifier pair to the table (the renderer indices stay
++ * valid) and returns its index. */
++static int
++format_table_append(struct weston_dmabuf_feedback_format_table *format_table,
++		    uint32_t format, uint64_t modifier, uint16_t *index_out)
++{
++	unsigned int num_elements = format_table->size / sizeof(*format_table->data);
++	unsigned int new_size = format_table->size + sizeof(*format_table->data);
++	void *data;
++
++	if (num_elements >= UINT16_MAX)
++		return -1;
++	if (ftruncate(format_table->fd, new_size) < 0)
++		return -1;
++	data = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED,
++		    format_table->fd, 0);
++	if (data == MAP_FAILED)
++		return -1;
++	munmap(format_table->data, format_table->size);
++	format_table->data = data;
++	format_table->size = new_size;
++
++	format_table->data[num_elements].format = format;
++	format_table->data[num_elements].modifier = modifier;
++	*index_out = num_elements;
++
++	return 0;
++}
++
+ /** Set scanout formats indices in the dma-buf feedback format table
+  *
+  * The table consists of the formats supported by the renderer. A dma-buf
+@@ -649,6 +678,12 @@ weston_dmabuf_feedback_format_table_set_scanout_indices(struct weston_dmabuf_fee
+ 
+ 			ret = format_table_get_format_index(format_table, fmt->format,
+ 							    modifiers[i], &index);
++			/* A pair that only the planes support (the renderer
++			 * cannot import it): add it to the table, the client
++			 * may allocate it for scan-out-only buffers. */
++			if (ret < 0)
++				ret = format_table_append(format_table, fmt->format,
++							  modifiers[i], &index);
+ 			if (ret < 0)
+ 				goto err;
+ 
+-- 
+2.55.0
+
