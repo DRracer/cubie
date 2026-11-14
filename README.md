@@ -31,7 +31,7 @@ general, the overlays and Bluetooth notes are board specific.
 | Cubietruck Bluetooth (AP6210) | setup fails on about half the boots; cannot scan or pair | works (crystal-gated power-up) | 0006-0008 + [`boards/cubietruck/bluetooth/`](boards/cubietruck/bluetooth/) |
 | RTC accuracy (A20) | internal RC oscillator, -3.2 % | 32 kHz crystal, -28 ppm | 0006-0008 |
 | HDMI audio (A10) | stream open times out; DMA channel leak per modeset | works | 0040, 0041 |
-| SoC temperature (A10) | every read busy-waits 100 ms (10 % CPU) | fixed | 0039 |
+| SoC temperature | every read busy-waits 100 ms (10 % CPU on the A10); no hwmon device; oops after a GPADC module reload | fixed; `sensors`/htop show the SoC temperature (`cpu_thermal`) | 0039, 0047-0049 |
 | MK802 board support | no PMIC (no DVFS), WiFi of the RTL8188EUS revision dead | AXP209, WiFi on PH3 | 0037 |
 
 Wayland: zero-copy video works on a patched Weston, not on wlroots compositors; the desktop stays
@@ -41,7 +41,7 @@ on Xorg for now ([`userspace/wayland/`](userspace/wayland/)).
 
 | Path | What |
 |---|---|
-| [`kernel/sunxi-6.18/`](kernel/sunxi-6.18/) | the series 0001-0046 for Linux 6.18.56 as Armbian userpatches, with an index |
+| [`kernel/sunxi-6.18/`](kernel/sunxi-6.18/) | the series 0001-0049 for Linux 6.18.56 as Armbian userpatches, with an index |
 | [`kernel/upstream/`](kernel/upstream/) | series prepared for the mainline kernel (not sent yet) |
 | [`armbian/`](armbian/) | Armbian build configs (A20, A10), the Cubietruck DRAM 432 MHz u-boot patch, build and install steps |
 | [`overlays/`](overlays/) | device-tree overlays (CMA pools, Cubietruck Bluetooth, A20 1008 MHz) |

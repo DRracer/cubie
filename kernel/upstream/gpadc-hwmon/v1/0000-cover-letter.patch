@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Sat, 14 Nov 2026 11:22:55 +0100
+Subject: [PATCH 0/3] iio: adc: sun4i-gpadc: thermal zone lifetime fix and a hwmon interface
+To: Jonathan Cameron <jic23@kernel.org>,
+    Rafael J. Wysocki <rafael@kernel.org>,
+    Daniel Lezcano <daniel.lezcano@kernel.org>
+Cc: David Lechner <dlechner@baylibre.com>,
+    Nuno Sá <nuno.sa@analog.com>,
+    Andy Shevchenko <andy@kernel.org>,
+    Chen-Yu Tsai <wens@kernel.org>,
+    Jernej Skrabec <jernej.skrabec@gmail.com>,
+    Samuel Holland <samuel@sholland.org>,
+    Zhang Rui <rui.zhang@intel.com>,
+    Lukasz Luba <lukasz.luba@arm.com>,
+    linux-iio@vger.kernel.org,
+    linux-pm@vger.kernel.org,
+    linux-sunxi@lists.linux.dev,
+    linux-arm-kernel@lists.infradead.org,
+    linux-kernel@vger.kernel.org
+
+The GPADC of the Allwinner A10, A13 and A20 holds the SoC's only
+temperature sensor. Two problems with how the driver registers it as a
+thermal zone:
+
+Patch 1 is a fix for stable. In MFD mode the zone is registered with
+devres on the parent device, so unloading the IIO module leaves it
+registered with dangling ops and devdata; the thermal workqueue oopses
+on the next poll. This was fixed once in 2017 and came back with the
+conversion to the new OF thermal API in 2022. It applies on its own.
+
+Patches 2 and 3 give the zone a hwmon interface, so the SoC temperature
+reaches libsensors and the tools built on it (sensors, htop's CPU
+temperature): today it is visible only in the thermal zone's sysfs.
+devm_thermal_add_hwmon_sysfs() is declared in a header private to
+drivers/thermal/, so patch 2 moves its declaration to <linux/thermal.h>;
+patch 3 uses it the way sun8i_thermal does for the newer Allwinner SoCs.
+The zone is "cpu-thermal" in the device trees, so the hwmon device is
+"cpu_thermal", a name tools already treat as a CPU temperature. The
+MFD's iio_hwmon cell already exposes the raw temperature on kernels with
+CONFIG_SENSORS_IIO_HWMON (multi_v7_defconfig), as an anonymous
+"iio_hwmon" chip; there it is now listed twice. Patch 3 says why the
+named interface is still worth having.
+
+Patch 2 touches the thermal core and patches 1 and 3 the IIO driver;
+patch 3 depends on 2. If the thermal maintainers prefer, 2 and 3 can go
+through one tree with an ack from the other.
+
+Tested on an A10 board (Rikomagic MK802, kernel 6.18 with the series
+backported): the unload/reload oops is gone over four cycles, and
+cpu_thermal appears with the same reading as the zone. The A20 follows
+the same MFD path; its test is pending.
+
+D.R.racer (3):
+  iio: adc: sun4i-gpadc: unregister the thermal zone with the IIO device
+  thermal: hwmon: make devm_thermal_add_hwmon_sysfs() available outside
+    the core
+  iio: adc: sun4i-gpadc: add a hwmon interface for the thermal zone
+
+ drivers/iio/adc/sun4i-gpadc-iio.c | 29 +++++++++++++++++++++++++++++
+ drivers/thermal/thermal_hwmon.h   |  7 -------
+ include/linux/thermal.h           | 10 ++++++++++
+ 3 files changed, 39 insertions(+), 7 deletions(-)
+
+
+base-commit: 7e1392a42ea288d70a266f6553fe06f57f8647ea
+-- 
+2.55.0
+

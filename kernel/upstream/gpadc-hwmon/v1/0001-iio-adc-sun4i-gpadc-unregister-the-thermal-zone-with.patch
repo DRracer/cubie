@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Sat, 14 Nov 2026 11:04:25 +0100
+Subject: [PATCH 1/3] iio: adc: sun4i-gpadc: unregister the thermal zone with
+ the IIO device
+To: Jonathan Cameron <jic23@kernel.org>,
+    Rafael J. Wysocki <rafael@kernel.org>,
+    Daniel Lezcano <daniel.lezcano@kernel.org>
+Cc: David Lechner <dlechner@baylibre.com>,
+    Nuno Sá <nuno.sa@analog.com>,
+    Andy Shevchenko <andy@kernel.org>,
+    Chen-Yu Tsai <wens@kernel.org>,
+    Jernej Skrabec <jernej.skrabec@gmail.com>,
+    Samuel Holland <samuel@sholland.org>,
+    Zhang Rui <rui.zhang@intel.com>,
+    Lukasz Luba <lukasz.luba@arm.com>,
+    linux-iio@vger.kernel.org,
+    linux-pm@vger.kernel.org,
+    linux-sunxi@lists.linux.dev,
+    linux-arm-kernel@lists.infradead.org,
+    linux-kernel@vger.kernel.org
+
+On the A10, A13, A20 and A31 the IIO device is a child of the
+sun4i-gpadc MFD, and the thermal zone is registered for the parent
+device, whose DT node holds the sensor. Since the conversion to the new
+OF thermal API it is registered with devm_thermal_of_zone_register() on
+that parent, so it stays registered when the IIO driver is unbound or
+unloaded, with ops and devdata pointing to the freed driver.
+
+Unloading and reloading the module on an A10 board oopses in the
+thermal workqueue a second later (the new zone shows up as
+thermal_zone1 next to the stale thermal_zone0):
+
+  Unable to handle kernel NULL pointer dereference at virtual address 0000002c when read
+  PC is at sun4i_gpadc_get_temp+0x36/0x64 [sun4i_gpadc_iio]
+  Workqueue: thermal_events thermal_zone_device_check
+   sun4i_gpadc_get_temp [sun4i_gpadc_iio] from __thermal_zone_get_temp+0x11/0x3c
+   __thermal_zone_get_temp from __thermal_zone_device_update+0x71/0x3d8
+
+Commit 82237f268281 ("iio: adc: sun4i-gpadc-iio: fix parent device
+being used in devm function") fixed this once by unregistering the zone
+in .remove(); the conversion dropped that. The zone cannot simply be
+registered for the IIO device, as devm_thermal_of_zone_register() takes
+the sensor node from the device it is given. Release the parent's zone
+with a devm action on the IIO device instead, which also covers the
+probe error path. The zone now goes after .remove() rather than at its
+start; a temperature read in between fails cleanly, as runtime PM is
+already disabled. In DT mode the zone already belongs to the IIO device.
+
+Tested on an A10 board (Rikomagic MK802): four unload/reload cycles
+without an oops (with the whole series applied); the zone goes away with
+the module and comes back with it.
+
+Fixes: de15b8403fa9 ("iio/drivers/sun4i_gpadc: Switch to new of thermal API")
+Cc: stable@vger.kernel.org
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/iio/adc/sun4i-gpadc-iio.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/drivers/iio/adc/sun4i-gpadc-iio.c b/drivers/iio/adc/sun4i-gpadc-iio.c
+index ac5ba76b979..420b921849a 100644
+--- a/drivers/iio/adc/sun4i-gpadc-iio.c
++++ b/drivers/iio/adc/sun4i-gpadc-iio.c
+@@ -595,6 +595,13 @@ static int sun4i_gpadc_probe_mfd(struct platform_device *pdev,
+ 	return 0;
+ }
+ 
++static void sun4i_gpadc_unregister_tz(void *data)
++{
++	struct sun4i_gpadc_iio *info = data;
++
++	devm_thermal_of_zone_unregister(info->sensor_device, info->tzd);
++}
++
+ static int sun4i_gpadc_probe(struct platform_device *pdev)
+ {
+ 	struct sun4i_gpadc_iio *info;
+@@ -643,6 +650,19 @@ static int sun4i_gpadc_probe(struct platform_device *pdev)
+ 					    "could not register thermal sensor\n");
+ 			goto err_map;
+ 		}
++
++		/*
++		 * In MFD mode the zone is registered for the parent device,
++		 * whose DT node holds the sensor, so devres would keep it
++		 * until the parent goes away. Unregister it with this device.
++		 */
++		if (!IS_ERR(info->tzd) && info->sensor_device != &pdev->dev) {
++			ret = devm_add_action_or_reset(&pdev->dev,
++						       sun4i_gpadc_unregister_tz,
++						       info);
++			if (ret)
++				goto err_map;
++		}
+ 	}
+ 
+ 	ret = devm_iio_device_register(&pdev->dev, indio_dev);
+-- 
+2.55.0
+

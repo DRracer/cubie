@@ -13,7 +13,7 @@ have moved on; start from that commit.
 | `userpatches/u-boot/v2026.07-sunxi/board_cubietruck/` | optional: Cubietruck DRAM at 432 MHz instead of Armbian's 384 MHz (see [`../boards/cubietruck/README.md`](../boards/cubietruck/README.md)) |
 
 The kernel patches themselves are in [`../kernel/sunxi-6.18/`](../kernel/sunxi-6.18/) (index with
-what each patch is needed for). The tested kernels had all of 0001-0046; you can leave out patches
+what each patch is needed for). The tested kernels had all of 0001-0046 (0047-0049 are newer, see the index); you can leave out patches
 you do not want, see the index (notably 0001/0002, which loosen DRM access for the VDPAU player
 path).
 

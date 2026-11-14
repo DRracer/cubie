@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "D.R.racer" <drracer@seznam.cz>
+Date: Fri, 13 Nov 2026 07:18:03 +0100
+Subject: [PATCH] iio: adc: sun4i-gpadc: add a hwmon interface for the
+ thermal zone
+
+The GPADC of the Allwinner A10, A13 and A20 holds the SoC's only
+temperature sensor, which the driver registers as the "cpu-thermal"
+zone from the device tree. Device tree zones get no hwmon interface.
+The MFD also instantiates an iio_hwmon device for the temperature
+channel, but only kernels with CONFIG_SENSORS_IIO_HWMON get it
+(multi_v7_defconfig has it, sunxi_defconfig does not), and it appears
+as a generic "iio_hwmon" chip that tools cannot tell from any other IIO
+temperature. So libsensors-based tools like sensors or htop's CPU
+temperature either miss the SoC temperature or do not know it is one.
+
+Register the zone's hwmon interface as sun8i_thermal does for the newer
+Allwinner SoCs. It is named after the zone, "cpu_thermal", like the
+zones of other ARM SoCs, which tools already recognise. With
+CONFIG_SENSORS_IIO_HWMON the temperature is now listed twice, once per
+interface.
+
+Tested on an A10 board (Rikomagic MK802, without SENSORS_IIO_HWMON):
+cpu_thermal appears with the zone's reading and htop shows the CPU
+temperature.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ drivers/iio/adc/sun4i-gpadc-iio.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/iio/adc/sun4i-gpadc-iio.c b/drivers/iio/adc/sun4i-gpadc-iio.c
+index 1ee3da9ba..bb9926d7f 100644
+--- a/drivers/iio/adc/sun4i-gpadc-iio.c
++++ b/drivers/iio/adc/sun4i-gpadc-iio.c
+@@ -666,6 +666,15 @@ static int sun4i_gpadc_probe(struct platform_device *pdev)
+ 			if (ret)
+ 				goto err_map;
+ 		}
++
++		/*
++		 * Device tree thermal zones get no hwmon interface by default.
++		 * Optional: the helper warns on its own if it fails. Keep this
++		 * after the zone and its release action: devres runs in
++		 * reverse order, and the hwmon device must go first.
++		 */
++		if (!IS_ERR(info->tzd))
++			devm_thermal_add_hwmon_sysfs(&pdev->dev, info->tzd);
+ 	}
+ 
+ 	ret = devm_iio_device_register(&pdev->dev, indio_dev);
+-- 
+2.55.0
+

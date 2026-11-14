@@ -8,6 +8,7 @@ letter or in the patch below `---`. The `Signed-off-by:` is added at sending tim
 | Directory | Series | Base | From userpatches | State |
 |---|---|---|---|---|
 | `lima/v1/` | drm/lima: fix a heap-grow page fault and the recovery from MMU faults (5) | drm-misc-next | 0042-0046 | ready |
+| `gpadc-hwmon/v1/` | iio: adc: sun4i-gpadc: thermal zone lifetime fix and a hwmon interface (3) | mainline 7.4-rc2+ | 0047-0049 | driver changes tested on the A10 as a 6.18 module; 2/3 build-tested; A20 pending |
 | `v4l2-jpeg/v1/` | media: v4l2-jpeg: fix segment length handling in the header parser (3) | v7.3 | 0034 | ready |
 | `drm-sun4i-fe-second-pipeline/v1/` | drm/sun4i: backend: route the frontend of a second pipeline | v7.3-rc7 | 0013 | ready; the v7.3-rc7 version build-tested |
 | `drm-sun4i-cursor/v1/` | drm/sun4i: backend: expose the hardware cursor as a cursor plane | v7.3-rc7 | 0014 | build-tested; differs from the tested 6.18 version |
@@ -18,7 +19,7 @@ letter or in the patch below `---`. The `Signed-off-by:` is added at sending tim
 
 Not here yet: the MBUS DMA offset fixes (0005, 0009; waiting for a hardware check), the 2D engine
 driver (0018-0022, 0038; new uAPI, needs an RFC), the video engine work (0023-0036; builds on
-Bootlin's unmerged cedrus rework, needs coordination with its authors) and the gpadc fix (0039).
+Bootlin's unmerged cedrus rework, needs coordination with its authors) and the gpadc mode-change fix (0039).
 
 Each patch discloses the AI assistance with `Assisted-by: Claude:claude-opus-5-5`, as
 `Documentation/process/coding-assistants.rst` asks; the cover letters say it in their text.

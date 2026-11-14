@@ -5,7 +5,9 @@ One series for the A10 and the A20. The patches apply in order on top of Armbian
 kernel with them. "Needed for" says which feature breaks if you leave a patch out.
 
 Tested kernels: all of 0001-0046 on a Cubietruck (A20, 2 GiB) and on a Rikomagic MK802 (A10,
-1 GiB). Each patch description says what was tested on which board.
+1 GiB). Each patch description says what was tested on which board. **0047-0049 are newer and not
+yet in a tested kernel:** the driver changes of 0047/0049 ran on the MK802 as an equivalent
+out-of-tree module (4 unload/load cycles), 0048 is build-tested only, the A20 is untested.
 
 | # | Patch | Needed for | Upstream |
 |---|---|---|---|
@@ -55,6 +57,9 @@ Tested kernels: all of 0001-0046 on a Cubietruck (A20, 2 GiB) and on a Rikomagic
 | 0044 | drm/lima: let a faulted core finish its bus transactions before the reset | GPU stays wedged after a page fault (frozen desktop until a reboot) | same |
 | 0045 | drm/lima: cancel a pending heap recovery in the timeout handler | race found by review, not seen on hardware | same |
 | 0046 | drm/lima: flush the L2 cache and TLB after growing the heap | **the rare GPU page fault** (`gpmmu page fault at 0x...`, Mali hang): root-caused on the A10, very likely the same on the A20 | same |
+| 0047 | iio: adc: sun4i-gpadc: unregister the thermal zone with the IIO device | oops when the GPADC module is removed and loaded again | [prepared](../upstream/gpadc-hwmon/v1/) |
+| 0048 | thermal: hwmon: make devm_thermal_add_hwmon_sysfs() available outside the core | 0049 | same |
+| 0049 | iio: adc: sun4i-gpadc: add a hwmon interface for the thermal zone | SoC temperature in `sensors`/htop (hwmon chip `cpu_thermal`) | same |
 
 "Prepared" means a series for the mainline kernel exists in [`../upstream/`](../upstream/) but has
 not been sent yet; "later" means it still needs a mainline rebase first.
